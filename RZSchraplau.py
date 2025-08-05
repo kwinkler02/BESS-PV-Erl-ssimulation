@@ -255,3 +255,23 @@ if st.sidebar.button('▶️ Simulation starten'):
             file_name=f"res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
+      # ── Dashboard-Übersicht ──────────────────────────────────────────────────────
+if price_file and pv_file and ev_file:
+    # Daten schon geladen?
+    try:
+        # Schneller Load (ohne Solver)
+        p_df = load_price_df(price_file)
+        pv_df = load_pv_df(pv_file)
+        ev_df = load_ev_df(ev_file)
+        valid, _ = validate_data(p_df, pv_df, ev_df)
+        if valid:
+            ts_all = p_df['Zeitstempel']
+            t0, tN = ts_all.min(), ts_all.max()
+            interval_h = ts_all.diff().dropna().mode()[0].total_seconds()/3600.0
+            st.markdown(\"### Übersicht\")
+            c1, c2, c3 = st.columns(3)
+            c1.metric(\"Zeitpunkte gesamt\", f\"{len(ts_all)}\")
+            c2.metric(\"Intervall [h]\", f\"{interval_h:.2f}\")
+            c3.metric(\"Zeitraum\", f\"{t0.date()} – {tN.date()}\")
+    except:
+        pass
