@@ -170,11 +170,18 @@ if price_file and pv_file and ev_file:
             ts_all = p_df['Zeitstempel']
             t0, tN = ts_all.min(), ts_all.max()
             interval = ts_all.diff().dropna().mode()[0].total_seconds()/3600.0
+            # Hauptbereich
             st.markdown('### Übersicht')
             c1, c2, c3 = st.columns(3)
             c1.metric('Zeitpunkte gesamt', f"{len(ts_all)}")
             c2.metric('Intervall [h]', f"{interval:.2f}")
             c3.metric('Zeitraum', f"{t0.date()} – {tN.date()}")
+            # Sidebar-Kopie der Übersicht
+            st.sidebar.markdown('---')
+            st.sidebar.markdown('### Übersicht')
+            st.sidebar.metric('Zeitpunkte gesamt', f"{len(ts_all)}")
+            st.sidebar.metric('Intervall [h]', f"{interval:.2f}")
+            st.sidebar.metric('Zeitraum', f"{t0.date()} – {tN.date()}")
     except:
         pass
 
