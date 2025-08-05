@@ -180,58 +180,78 @@ if st.sidebar.button('▶️ Simulation starten'):
         st.sidebar.error('Bitte alle Dateien hochladen.')
     else:
         # Laden & Validieren
-        p_df = load_price_df(price_file)
-        pv_df= load_pv_df(pv_file)
-        ev_df= load_ev_df(ev_file)
-        valid,msg = validate_data(p_df,pv_df,ev_df)
+        p_df  = load_price_df(price_file)
+        pv_df = load_pv_df(pv_file)
+        ev_df = load_ev_df(ev_file)
+        valid, msg = validate_data(p_df, pv_df, ev_df)
         if not valid:
-            st.error(msg); st.stop()
-        # Arrays
-        ts     = p_df['Zeitstempel']
-        prices = p_df['Preis_€/MWh'].to_numpy()/1000.0
-        pv     = pv_df['PV_kWh'].to_numpy()
-        ev     = ev_df['EV_kWh'].to_numpy()
-        interval_h = ts.diff().dropna().mode()[0].total_seconds()/3600.0
-        st.info(f'Intervall: {interval_h} h')
-        # Solver
-        free = [solve_battery(prices,pv,ev,c,grid_kw,interval_h,set_progress) for c in configs]
-        obj_joint, chs_joint, dhs_joint = solve_joint(prices,pv,ev,configs,grid_kw,interval_h,set_progress)
+            st.error(msg)
+            st.stop()
+
+        # Zeitreihen-Daten extrahieren
+        ts         = p_df['Zeitstempel']
+        prices     = p_df['Preis_€/MWh'].to_numpy() / 1000.0
+        pv         = pv_df['PV_kWh'].to_numpy()
+        ev         = ev_df['EV_kWh'].to_numpy()
+        interval_h = ts.diff().dropna().mode()[0].total_seconds() / 3600.0
+        st.info(f'Intervall: {interval_h:.4f} h')
+
+        # Solver aufrufen
+        free_results = []
+        for cfg in configs:
+            free_results.append(solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, set_progress))
+        obj_joint, chs_joint, dhs_joint = solve_joint(prices, pv, ev, configs, grid_kw, interval_h, set_progress)
+
         # Einzeloptimierung anzeigen
         st.subheader('Einzeloptimierung')
-        tot_free = 0
-        for idx,(cfg,(obj,_,_)) in enumerate(zip(configs,free), start=1):
+        total_free = sum(obj for obj, *_ in free_results)
+        for idx, (cfg, (obj, _, _)) in enumerate(zip(configs, free_results), start=1):
             st.metric(f"B{idx} ({cfg['mode']})", fmt_euro(obj))
-            tot_free += obj
-        st.metric('Gesamt Free', fmt_euro(tot_free))
-        # Gemeinsame Optimierung
+        st.metric('Gesamt Free', fmt_euro(total_free))
+
+        # Gemeinsame Optimierung anzeigen
         st.subheader('Gemeinsam')
         st.metric('Gesamt', fmt_euro(obj_joint))
-        for idx,cfg in enumerate(configs, start=1):
-            ind = float(np.dot(prices, dhs_joint[idx-1] - chs_joint[idx-1]))
-            st.metric(f"B{idx} Anteil", fmt_euro(ind))
+        for idx, cfg in enumerate(configs, start=1):
+            share = float(np.dot(prices, dhs_joint[idx-1] - chs_joint[idx-1]))
+            st.metric(f"B{idx} Anteil", fmt_euro(share))
+
         # Vergleich
-        imp = obj_joint - tot_free
-        pct = (imp / abs(tot_free) * 100) if tot_free!=0 else 0
+        delta = obj_joint - total_free
+        pct = (delta / abs(total_free) * 100) if total_free != 0 else 0
         st.subheader('Vergleich')
-        c1,c2,c3 = st.columns(3)
-        c1.metric('Δ absolut', fmt_euro(imp))
+        c1, c2, c3 = st.columns(3)
+        c1.metric('Δ absolut', fmt_euro(delta))
         c2.metric('Δ %', f"{pct:.2f}%")
         net_load = pv + ev + sum(chs_joint) - sum(dhs_joint)
-        net_util = np.mean(net_load/(grid_kw*interval_h))*100
+        net_util = np.mean(net_load / (grid_kw * interval_h)) * 100
         c3.metric('Netzauslastung', f"{net_util:.1f}%")
+
         # Ergebnisse als Tabelle & Download
         st.subheader('Ergebnisse')
-        out = pd.DataFrame({'Zeit':ts, 'Preis_€/kWh':prices, 'PV_kWh':pv, 'EV_kWh':ev})
+        out = pd.DataFrame({
+            'Zeit': ts,
+            'Preis_€/kWh': prices,
+            'PV_kWh': pv,
+            'EV_kWh': ev
+        })
         for idx in range(len(configs)):
-            out[f'B{idx+1}_Laden_kWh'] = chs_joint[idx]
+            out[f'B{idx+1}_Laden_kWh']   = chs_joint[idx]
             out[f'B{idx+1}_Entladen_kWh'] = dhs_joint[idx]
         out['Netzlast_kWh'] = net_load
-        out['Netzlast_%'] = net_load/(grid_kw*interval_h)*100
-        viol = (net_load > grid_kw*interval_h).sum()
-        if viol>0:
-            st.warning(f"⚠️ {viol} Überlastungen")
+        out['Netzlast_%']   = net_load / (grid_kw * interval_h) * 100
+        violations = (net_load > grid_kw * interval_h).sum()
+        if violations > 0:
+            st.warning(f"⚠️ {violations} Überlastungen im Netz")
         st.dataframe(out)
+
+        # Excel-Export
         buf = BytesIO()
         out.to_excel(buf, index=False, engine='openpyxl')
         buf.seek(0)
-        st.download_button('📥 Excel-Export', buf, file_name=f'res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        st.download_button(
+            '📥 Excel-Export',
+            buf,
+            file_name=f"res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
