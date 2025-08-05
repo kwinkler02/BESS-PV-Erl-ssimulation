@@ -190,6 +190,7 @@ if st.sidebar.button('▶️ Simulation starten'):
     if not (price_file and pv_file and ev_file):
         st.sidebar.error('Bitte alle Dateien hochladen.')
     else:
+        # Eingangs-Daten laden
         p_df = load_price_df(price_file)
         pv_df= load_pv_df(pv_file)
         ev_df= load_ev_df(ev_file)
@@ -198,19 +199,19 @@ if st.sidebar.button('▶️ Simulation starten'):
             st.error(msg)
             st.stop()
 
+        # Arrays
         ts         = p_df['Zeitstempel']
         prices     = p_df['Preis_€/MWh'].to_numpy()/1000.0
         pv         = pv_df['PV_kWh'].to_numpy()
         ev         = ev_df['EV_kWh'].to_numpy()
         interval_h = ts.diff().dropna().mode()[0].total_seconds()/3600.0
-
         st.sidebar.info(f'Intervall: {interval_h:.2f} h')
 
         # Solver
-        free_results = [solve_battery(prices,pv,ev,c,grid_kw,interval_h,set_progress) for c in configs]
-        obj_joint, chs_joint, dhs_joint = solve_joint(prices,pv,ev,configs,grid_kw,interval_h,set_progress)
+        free_results = [solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, set_progress) for cfg in configs]
+        obj_joint, chs_joint, dhs_joint = solve_joint(prices, pv, ev, configs, grid_kw, interval_h, set_progress)
 
-        # Einzeloptimierung
+        # Einzeloptimierung anzeigen
         st.subheader('Einzeloptimierung')
         tot_free = sum(obj for obj, *_ in free_results)
         for idx,(cfg,(obj,_,_)) in enumerate(zip(configs, free_results), start=1):
