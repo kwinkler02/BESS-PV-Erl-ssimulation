@@ -5,6 +5,22 @@ import pulp
 from io import BytesIO
 import locale
 
+# ── Fortschrittsanzeige ─────────────────────────────────────────────────────
+progress_bar = st.sidebar.progress(0)
+progress_text = st.sidebar.empty()
+def set_progress(pct: int):
+    progress_bar.progress(pct)
+    progress_text.markdown(f"**Fortschritt:** {pct}%")
+
+# ── Euro-Format ──────────────────────────────────────────────────────────────
+try:
+    locale.setlocale(locale.LC_ALL, 'de_DE.UTF-8')
+    def fmt_euro(x): return locale.currency(x, symbol=True, grouping=True)
+except locale.Error:
+    def fmt_euro(x):
+        s = f"{x:,.2f}".replace(",","X").replace(".",",").replace("X",".")
+        return s + ' €'
+
 # ── App-Konfiguration ─────────────────────────────────────────────────────────
 st.set_page_config(layout='wide')
 st.title('BESS: Single vs. Multi Use & Grid Constraint')
