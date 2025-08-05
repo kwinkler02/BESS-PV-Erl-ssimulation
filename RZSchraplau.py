@@ -35,9 +35,52 @@ def load_time_series(upl, usecols, names):
     else:
         df = pd.read_excel(upl, usecols=usecols, names=names,
                            header=0, engine='openpyxl')
-    df[names[0]] = pd.to_datetime(df[names[0]], dayfirst=True)
+    
+    # Flexible timestamp parsing
+    df[names[0]] = parse_flexible_timestamp(df[names[0]])
     df[names[1]] = pd.to_numeric(df[names[1]], errors='raise')
     return df
+
+def parse_flexible_timestamp(ts_series):
+    """Parse timestamps with different formats flexibly"""
+    parsed_ts = []
+    
+    for ts in ts_series:
+        if pd.isna(ts):
+            parsed_ts.append(pd.NaT)
+            continue
+            
+        ts_str = str(ts).strip()
+        
+        # Try different parsing methods
+        try:
+            # Method 1: Standard pandas parsing with dayfirst=True
+            parsed = pd.to_datetime(ts_str, dayfirst=True)
+            parsed_ts.append(parsed)
+        except:
+            try:
+                # Method 2: German format with 2-digit year (e.g., "1.1.25 0:00")
+                if '.' in ts_str and len(ts_str.split('.')[-1].split(' ')[0]) <= 2:
+                    # Assume 2-digit years >= 50 are 19xx, < 50 are 20xx
+                    parts = ts_str.split('.')
+                    if len(parts) >= 3:
+                        year_part = parts[2].split(' ')[0]
+                        if len(year_part) == 2:
+                            year = int(year_part)
+                            full_year = 2000 + year if year < 50 else 1900 + year
+                            new_ts_str = ts_str.replace(f".{year_part} ", f".{full_year} ")
+                            parsed = pd.to_datetime(new_ts_str, dayfirst=True)
+                            parsed_ts.append(parsed)
+                            continue
+                
+                # Method 3: Try with format inference
+                parsed = pd.to_datetime(ts_str, infer_datetime_format=True)
+                parsed_ts.append(parsed)
+            except:
+                # If all fails, return NaT
+                parsed_ts.append(pd.NaT)
+    
+    return pd.Series(parsed_ts)
 
 # Spezifische Loader bauen auf generisch auf
 def load_price_df(upl):
@@ -192,13 +235,44 @@ def solve_joint(prices, pv_vec, ev_vec, cfgs, grid_kw, interval_h, progress_call
     return obj, chs, dhs
 
 # ── Simulation Wrapper ──────────────────────────────────────────────────────
-def validate_data(price_df, pv_df, ev_df):
-    """Validate that all dataframes have consistent timestamps"""
-    if not all(df['Zeitstempel'].equals(price_df['Zeitstempel']) for df in [pv_df, ev_df]):
-        return False, "Zeitstempel in den Dateien sind nicht identisch!"
+def align_timestamps(price_df, pv_df, ev_df):
+    """Align timestamps across all dataframes and interpolate missing values"""
     
-    if not (len(price_df) == len(pv_df) == len(ev_df)):
-        return False, "Ungleiche Zeitreihenlängen."
+    # Get all unique timestamps and sort them
+    all_timestamps = pd.concat([
+        price_df['Zeitstempel'], 
+        pv_df['Zeitstempel'], 
+        ev_df['Zeitstempel']
+    ]).drop_duplicates().sort_values().reset_index(drop=True)
+    
+    # Create a base dataframe with all timestamps
+    base_df = pd.DataFrame({'Zeitstempel': all_timestamps})
+    
+    # Merge each dataset
+    aligned_price = base_df.merge(price_df, on='Zeitstempel', how='left')
+    aligned_pv = base_df.merge(pv_df, on='Zeitstempel', how='left')  
+    aligned_ev = base_df.merge(ev_df, on='Zeitstempel', how='left')
+    
+    # Forward fill missing values (use last known value)
+    aligned_price['Preis_€/MWh'] = aligned_price['Preis_€/MWh'].fillna(method='ffill').fillna(0)
+    aligned_pv['PV_kWh'] = aligned_pv['PV_kWh'].fillna(method='ffill').fillna(0)
+    aligned_ev['EV_kWh'] = aligned_ev['EV_kWh'].fillna(method='ffill').fillna(0)
+    
+    return aligned_price, aligned_pv, aligned_ev
+
+def validate_data(price_df, pv_df, ev_df):
+    """Validate that all dataframes have reasonable data"""
+    
+    if len(price_df) == 0 or len(pv_df) == 0 or len(ev_df) == 0:
+        return False, "Eine oder mehrere Dateien sind leer."
+    
+    # Check for any timestamps that failed to parse
+    if price_df['Zeitstempel'].isna().any():
+        return False, "Einige Zeitstempel in der Preisdatei konnten nicht geparst werden."
+    if pv_df['Zeitstempel'].isna().any():
+        return False, "Einige Zeitstempel in der PV-Datei konnten nicht geparst werden."  
+    if ev_df['Zeitstempel'].isna().any():
+        return False, "Einige Zeitstempel in der EV-Datei konnten nicht geparst werden."
     
     # Check for negative values where they shouldn't be
     if (price_df['Preis_€/MWh'] < -1000).any():
