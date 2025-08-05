@@ -21,41 +21,35 @@ except locale.Error:
         s = f"{x:,.2f}".replace(",","X").replace(".",",").replace("X",".")
         return s + " €"
 
-# ── Daten-Lader ──────────────────────────────────────────────────────────────
-def load_price_df(upl):
+# ── Daten-Lader (generisch) ─────────────────────────────────────────────────────────
+def load_time_series(upl, usecols, names):
+    """
+    Universeller Loader für CSV/XLS[X]:
+      upl: UploadedFile
+      usecols: Liste der Spaltenindices oder Namen
+      names: Liste von neuen Spaltennamen (Zeit, Wert)
+    """
     if upl.name.lower().endswith('.csv'):
-        df = pd.read_csv(upl, sep=';', decimal=',', usecols=[0,1],
-                         names=['Zeitstempel','Preis_€/MWh'], header=0)
+        df = pd.read_csv(upl, sep=';', decimal=',', usecols=usecols,
+                         names=names, header=0)
     else:
-        df = pd.read_excel(upl, usecols=[0,1], names=['Zeitstempel','Preis_€/MWh'],
+        df = pd.read_excel(upl, usecols=usecols, names=names,
                            header=0, engine='openpyxl')
-    df['Zeitstempel'] = pd.to_datetime(df['Zeitstempel'], dayfirst=True)
-    df['Preis_€/MWh'] = pd.to_numeric(df['Preis_€/MWh'], errors='raise')
+    df[names[0]] = pd.to_datetime(df[names[0]], dayfirst=True)
+    df[names[1]] = pd.to_numeric(df[names[1]], errors='raise')
     return df
+
+# Spezifische Loader bauen auf generisch auf
+def load_price_df(upl):
+    return load_time_series(upl, usecols=[0,1], names=['Zeitstempel','Preis_€/MWh'])
 
 def load_pv_df(upl):
-    if upl.name.lower().endswith('.csv'):
-        df = pd.read_csv(upl, sep=';', decimal=',', usecols=[0,1],
-                         names=['Zeitstempel','PV_kWh'], header=0)
-    else:
-        df = pd.read_excel(upl, usecols=[0,1], names=['Zeitstempel','PV_kWh'],
-                           header=0, engine='openpyxl')
-    df['Zeitstempel'] = pd.to_datetime(df['Zeitstempel'], dayfirst=True)
-    df['PV_kWh'] = pd.to_numeric(df['PV_kWh'], errors='raise')
-    return df
+    return load_time_series(upl, usecols=[0,1], names=['Zeitstempel','PV_kWh'])
 
 def load_ev_df(upl):
-    if upl.name.lower().endswith('.csv'):
-        df = pd.read_csv(upl, sep=';', decimal=',', usecols=[0,1],
-                         names=['Zeitstempel','EV_kWh'], header=0)
-    else:
-        df = pd.read_excel(upl, usecols=[0,1], names=['Zeitstempel','EV_kWh'],
-                           header=0, engine='openpyxl')
-    df['Zeitstempel'] = pd.to_datetime(df['Zeitstempel'], dayfirst=True)
-    df['EV_kWh'] = pd.to_numeric(df['EV_kWh'], errors='raise')
-    return df
+    return load_time_series(upl, usecols=[0,1], names=['Zeitstempel','EV_kWh'])
 
-# ── Einzelbatterie Solver ─────────────────────────────────────────────────────
+# ── Einzelbatterie Solver ───────────────────────────────────────────────────── ─────────────────────────────────────────────────────
 def solve_battery(prices, pv_vec, cfg, grid_kw, interval_h, progress_callback=None):
     T = len(prices)
     batt_max = cfg['bat_kw'] * interval_h
