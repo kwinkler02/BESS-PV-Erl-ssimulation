@@ -64,9 +64,12 @@ def load_ev_df(upl):    return load_generic_series(upl, 'EV_kWh')
 def validate_data(p_df, pv_df, ev_df):
     if p_df.empty or pv_df.empty or ev_df.empty:
         return False, 'Leere Datei'
+    # Zeitstempel validieren
     for df, name in [(p_df,'Preis'), (pv_df,'PV'), (ev_df,'EV')]:
         if df['Zeitstempel'].isna().any():
             return False, f"{name} Zeitstempel fehlerhaft"
+    # Negative Werte nur für PV und EV prüfen, Preise dürfen negativ sein
+    for df, name in [(pv_df,'PV'), (ev_df,'EV')]:
         if (df.iloc[:,1] < 0).any():
             return False, f"Neg. Last in {name} Datei"
     return True, 'OK'
