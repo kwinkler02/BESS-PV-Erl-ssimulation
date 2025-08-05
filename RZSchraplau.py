@@ -172,8 +172,14 @@ if enable2: configs.append(make_cfg(2))
 grid_kw=st.sidebar.number_input("Netzanschluss (kW)",0.0,1e6,757.5)
 
 if st.sidebar.button("▶️ Simulation starten"):
-    if not(price_file and pv_file and ev_file): st.sidebar.error("Bitte alle Dateien hochladen.")
-    else: st.session_state['res']=run_sim()
+    if not(price_file and pv_file and ev_file):
+        st.sidebar.error("Bitte alle Dateien hochladen.")
+    else:
+        try:
+            st.session_state['res'] = run_sim()
+        except Exception as e:
+            st.error(f"Fehler in Simulation: {e}")
+            import traceback; st.text(traceback.format_exc())
 
 if 'res' not in st.session_state:
     st.info("Bitte Simulation starten.")
