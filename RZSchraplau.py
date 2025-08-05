@@ -123,8 +123,8 @@ def solve_battery(prices, pv_vec, ev_vec, cfg, grid_kw, interval_h, progress_cal
         m += dh[t] >= interval_h*d[t] if cfg['mode'] == 'Single Use' else 0
         
         # Grid constraint: PV + EV + battery operations <= grid capacity
-        # For single battery: only consider its own operations
-        m += pv_vec[t] + ev_vec[t] + ch[t] <= grid_max
+        # Battery discharge reduces grid load, charging increases it
+        m += pv_vec[t] + ev_vec[t] + ch[t] - dh[t] <= grid_max
         
         # SOC dynamics
         prev = cfg['start_soc'] if t==0 else soc[t-1]
@@ -203,7 +203,9 @@ def solve_joint(prices, pv_vec, ev_vec, cfgs, grid_kw, interval_h, progress_call
             m += soc_vars[i][t] == prev + effs[i]*ch_vars[i][t] - dh_vars[i][t]/effs[i]
         
         # CORRECTED: Grid constraint including PV and EV loads
-        m += pv_vec[t] + ev_vec[t] + pulp.lpSum(ch_vars[i][t] for i in range(n)) <= grid_max
+        # Note: Battery discharge reduces grid load, charging increases it
+        total_battery_load = pulp.lpSum(ch_vars[i][t] - dh_vars[i][t] for i in range(n))
+        m += pv_vec[t] + ev_vec[t] + total_battery_load <= grid_max
         
         if progress_callback and t%(max(1,T//50))==0:
             progress_callback(5+int(45*t/T))
@@ -292,10 +294,18 @@ def run_sim():
     pv_df = load_pv_df(pv_file)
     ev_df = load_ev_df(ev_file)
     
-    # Validate data
+    # Validate individual datasets
     is_valid, error_msg = validate_data(price_df, pv_df, ev_df)
     if not is_valid:
         st.error(error_msg)
+        st.stop()
+    
+    # Align timestamps across all datasets
+    try:
+        price_df, pv_df, ev_df = align_timestamps(price_df, pv_df, ev_df)
+        st.info(f"Daten erfolgreich aligniert. {len(price_df)} Zeitpunkte werden verwendet.")
+    except Exception as e:
+        st.error(f"Fehler beim Alignieren der Timestamps: {e}")
         st.stop()
     
     # Extract time series
@@ -304,8 +314,11 @@ def run_sim():
     pv = pv_df['PV_kWh'].to_numpy()
     ev = ev_df['EV_kWh'].to_numpy()
     
-    # Calculate interval
-    interval_h = (ts[1] - ts[0]).total_seconds() / 3600.0
+    # Calculate interval (use most common interval)
+    time_diffs = ts.diff().dropna()
+    interval_h = time_diffs.mode()[0].total_seconds() / 3600.0
+    
+    st.info(f"Erkanntes Zeitintervall: {interval_h} Stunden")
     
     # Validate configurations
     for i, cfg in enumerate(configs):
@@ -445,6 +458,11 @@ total_grid_load = pv + ev + sum(joint_chs) - sum(joint_dhs)
 out['Netzlast_kWh'] = total_grid_load
 out['Netzlast_%'] = (total_grid_load / (grid_kw * iv)) * 100
 
+# Show grid constraint violations
+violations = total_grid_load > (grid_kw * iv)
+if violations.any():
+    st.warning(f"⚠️ {violations.sum()} Zeitpunkte mit Netzüberlastung gefunden!")
+    
 st.dataframe(out)
 
 # Download button
