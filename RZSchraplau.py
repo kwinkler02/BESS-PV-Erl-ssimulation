@@ -246,7 +246,7 @@ def main():
                 # Einzeloptimierung anzeigen
                 st.subheader('Einzeloptimierung')
                 tot_free = sum(obj for obj, *_ in free_results)
-                for idx,(cfg,(obj,*,*)) in enumerate(zip(configs, free_results), start=1):
+                for idx, (cfg, (obj, ch_v, dh_v)) in enumerate(zip(configs, free_results), start=1):
                     st.metric(f"B{idx} ({cfg['mode']})", fmt_euro(obj))
                 st.metric('Gesamt Free', fmt_euro(tot_free))
                 # Joint
@@ -309,3 +309,4 @@ def save_configuration(pv_scale, ev_scale, configs, grid_kw):
 
 if __name__ == '__main__':
     main()
+
