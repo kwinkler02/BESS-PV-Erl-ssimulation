@@ -4,28 +4,21 @@ import numpy as np
 import pulp
 from io import BytesIO
 import locale
+import json
 
-# ── Fortschrittsanzeige ─────────────────────────────────────────────────────
-progress_bar = st.sidebar.progress(0)
-progress_text = st.sidebar.empty()
+# ── Fortschrittsanzeige ─────────────────────────────
 def set_progress(pct: int):
-    progress_bar.progress(pct)
-    progress_text.markdown(f"**Fortschritt:** {pct}%")
+    st.session_state.progress_bar.progress(pct)
+    st.session_state.progress_text.markdown(f"**Fortschritt:** {pct}%")
 
-# ── Euro-Format ──────────────────────────────────────────────────────────────
+# ── Euro-Format ─────────────────────────────────────
 try:
     locale.setlocale(locale.LC_ALL, 'de_DE.UTF-8')
     def fmt_euro(x): return locale.currency(x, symbol=True, grouping=True)
 except locale.Error:
-    def fmt_euro(x):
-        s = f"{x:,.2f}".replace(",","X").replace(".",",").replace("X",".")
-        return s + ' €'
+    def fmt_euro(x): return f"{x:,.2f}".replace(",","X").replace(".",",").replace("X",".") + ' €'
 
-# ── App-Konfiguration ─────────────────────────────────────────────────────────
-st.set_page_config(layout='wide')
-st.title('BESS: Single vs. Multi Use & Grid Constraint')
-
-# ── Flexibler Zeitstempel-Parser ──────────────────────────────────────────────
+# ── Flexibler Zeitstempel-Parser ────────────────────
 def parse_flexible_timestamp(ts_series):
     parsed = []
     for ts in ts_series:
@@ -39,7 +32,7 @@ def parse_flexible_timestamp(ts_series):
             try:
                 if '.' in s and len(s.split('.')[-1].split(' ')[0]) <= 2:
                     parts = s.split('.')
-                    y = parts[2].split(' ')[0]
+                    y = parts[1].split(' ')
                     if len(y) == 2:
                         yy = int(y)
                         full = 2000 + yy if yy < 50 else 1900 + yy
@@ -49,7 +42,7 @@ def parse_flexible_timestamp(ts_series):
                 parsed.append(pd.NaT)
     return pd.Series(parsed)
 
-# ── Generischer Daten-Loader (erste 2 Spalten) ─────────────────────────────────
+# ── Generischer Daten-Loader ────────────────────────
 def load_generic_series(upl, col_name):
     if upl.name.lower().endswith('.csv'):
         df = pd.read_csv(upl, sep=';', decimal=',', usecols=[0,1], header=0)
@@ -64,7 +57,7 @@ def load_price_df(upl): return load_generic_series(upl, 'Preis_€/MWh')
 def load_pv_df(upl):    return load_generic_series(upl, 'PV_kWh')
 def load_ev_df(upl):    return load_generic_series(upl, 'EV_kWh')
 
-# ── Datenvalidierung ───────────────────────────────────────────────────────────
+# ── Datenvalidierung ────────────────────────────────
 def validate_data(p_df, pv_df, ev_df):
     if p_df.empty or pv_df.empty or ev_df.empty:
         return False, 'Leere Datei'
@@ -78,7 +71,7 @@ def validate_data(p_df, pv_df, ev_df):
             return False, f"Neg. Last in {name} Datei"
     return True, 'OK'
 
-# ── Solver-Funktionen ─────────────────────────────────────────────────────────
+# ── Solver Funktion (Single Batterie) ───────────────
 def solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, progress=None):
     T = len(prices)
     batt_max = cfg['bat_kw'] * interval_h
@@ -114,6 +107,7 @@ def solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, progress=None):
     if progress: progress(100)
     return obj, ch_v, dh_v
 
+# ── Solver Funktion (Multi-Batterie/Szenario) ───────
 def solve_joint(prices, pv, ev, cfgs, grid_kw, interval_h, progress=None):
     n, T = len(cfgs), len(prices)
     grid_max = grid_kw * interval_h
@@ -157,124 +151,161 @@ def solve_joint(prices, pv, ev, cfgs, grid_kw, interval_h, progress=None):
     if progress: progress(100)
     return obj, chs, dhs
 
-# ── Sidebar: Datei-Upload & Konfiguration ─────────────────────────────────────
-price_file = st.sidebar.file_uploader('Preise', type=['csv','xls','xlsx'])
-pv_file    = st.sidebar.file_uploader('PV-Last', type=['csv','xls','xlsx'])
-ev_file    = st.sidebar.file_uploader('EV-Last', type=['csv','xls','xlsx'])
-enable2    = st.sidebar.checkbox('Zweite Batterie', True)
-configs    = []
-for i in (1, 2):
-    if i == 1 or enable2:
-        st.sidebar.markdown(f'**Batterie {i}**')
-        mode  = st.sidebar.selectbox(f'Modus{i}', ['Single Use', 'Multi Use'], key=f'm{i}')
-        start = st.sidebar.number_input(f'StartSoC{i} (kWh)', 0.0, 1e6, 0.0, key=f's{i}')
-        cap   = st.sidebar.number_input(f'Kap{i} (kWh)', 0.1, 1e6, 4472.0, key=f'c{i}')
-        bkw   = st.sidebar.number_input(f'Leistung{i} (kW)', 0.1, 1e6, 559.0, key=f'p{i}')
-        eff   = st.sidebar.number_input(f'Eff{i} (%)', 1.0, 100.0, 91.0, key=f'e{i}')/100.0
-        cyc   = st.sidebar.number_input(f'Zyklen{i}', 0.0, 1e4, 548.0, key=f'y{i}')
-        configs.append({'mode':mode, 'start_soc':start, 'cap':cap, 'bat_kw':bkw, 'eff_pct':eff, 'max_cycles':cyc})
-grid_kw = st.sidebar.number_input('Netzanschluss (kW)', 0.1, 1e6, 37000.0)
+# ── Streamlit App (UI & Logik modularisiert) ────────
+def main():
+    st.set_page_config(layout='wide')
+    st.title('BESS: Skalierbar & Szenario-Vergleich')
 
-# ── Dashboard-Übersicht vor Simulation ────────────────────────────────────────
-if price_file and pv_file and ev_file:
-    try:
-        p_df = load_price_df(price_file)
-        pv_df = load_pv_df(pv_file)
-        ev_df = load_ev_df(ev_file)
-        valid, _ = validate_data(p_df, pv_df, ev_df)
-        if valid:
-            ts_all = p_df['Zeitstempel']
-            t0, tN = ts_all.min(), ts_all.max()
-            interval = ts_all.diff().dropna().mode()[0].total_seconds()/3600.0
-            # Hauptbereich
-            st.markdown('### Übersicht')
-            c1, c2, c3 = st.columns(3)
-            c1.metric('Zeitpunkte gesamt', f"{len(ts_all)}")
-            c2.metric('Intervall [h]', f"{interval:.2f}")
-            c3.metric('Zeitraum', f"{t0.date()} – {tN.date()}")
-            # Sidebar-Kopie der Übersicht
-            st.sidebar.markdown('---')
-            st.sidebar.markdown('### Übersicht')
-            st.sidebar.metric('Zeitpunkte gesamt', f"{len(ts_all)}")
-            st.sidebar.metric('Intervall [h]', f"{interval:.2f}")
-            st.sidebar.metric('Zeitraum', f"{t0.date()} – {tN.date()}")
-    except:
-        pass
+    # Fortschrittsanzeige initialisieren
+    if 'progress_bar' not in st.session_state:
+        st.session_state.progress_bar = st.sidebar.progress(0)
+        st.session_state.progress_text = st.sidebar.empty()
 
-# ── Simulation starten & Ergebnisse ───────────────────────────────────────────
-if st.sidebar.button('▶️ Simulation starten'):
-    if not (price_file and pv_file and ev_file):
-        st.sidebar.error('Bitte alle Dateien hochladen.')
-    else:
-        # Eingangs-Daten laden
-        p_df = load_price_df(price_file)
-        pv_df= load_pv_df(pv_file)
-        ev_df= load_ev_df(ev_file)
-        valid, msg = validate_data(p_df, pv_df, ev_df)
-        if not valid:
-            st.error(msg)
-            st.stop()
+    tab1, tab2, tab3 = st.tabs(['Konfiguration', 'Upload', 'Simulation'])
 
-        # Arrays
-        ts         = p_df['Zeitstempel']
-        prices     = p_df['Preis_€/MWh'].to_numpy()/1000.0
-        pv         = pv_df['PV_kWh'].to_numpy()
-        ev         = ev_df['EV_kWh'].to_numpy()
-        interval_h = ts.diff().dropna().mode()[0].total_seconds()/3600.0
-        st.sidebar.info(f'Intervall: {interval_h:.2f} h')
+    # ── Tab 1: Skalierungsfaktoren Konfiguration ──
+    with tab1:
+        st.markdown('### Skalierungsfaktoren')
+        pv_scale = st.number_input('PV-Skalierung (Anzahl)', 1, 20, 1, step=1)
+        ev_scale = st.number_input('EV-Skalierung (Anzahl)', 1, 20, 1, step=1)
+        grid_scale = st.number_input('Netzanschluss-Skalierung', 1.0, 5.0, 1.0, step=0.1)
+        enable2 = st.checkbox('Zweite Batterie aktivieren', True)
+        st.markdown('##### Batterie-Konfigurationen')
+        configs = []
+        bat_count = 2 if enable2 else 1
+        for i in range(bat_count):
+            st.markdown(f'**Batterie {i+1}**')
+            mode = st.selectbox(f'Modus{i+1}', ['Single Use', 'Multi Use'], key=f'm{i+1}')
+            start = st.number_input(f'Start-SoC{i+1} (kWh)', 0.0, 1e6, 0.0, key=f's{i+1}')
+            cap = st.number_input(f'Kapazität{i+1} (kWh)', 0.1, 1e6, 4472.0, key=f'c{i+1}')
+            cap_scale = st.number_input(f'Kapazität-Skalierung{i+1}', 1, 10, 1, key=f'cscale{i+1}')
+            bkw = st.number_input(f'Leistung{i+1} (kW)', 0.1, 1e6, 559.0, key=f'p{i+1}')
+            bkw_scale = st.number_input(f'Leistungs-Skalierung{i+1}', 1, 10, 1, key=f'pscale{i+1}')
+            eff = st.number_input(f'Wirkungsgrad{i+1} (%)', 1.0, 100.0, 91.0, key=f'e{i+1}') / 100.0
+            cyc = st.number_input(f'Max. Zyklen{i+1}', 0.0, 1e4, 548.0, key=f'y{i+1}')
+            configs.append({
+                'mode': mode,
+                'start_soc': start,
+                'cap': cap * cap_scale,
+                'bat_kw': bkw * bkw_scale,
+                'eff_pct': eff,
+                'max_cycles': cyc
+            })
+        grid_kw_input = st.number_input('Netzanschluss (kW)', 0.1, 1e6, 37000.0)
+        grid_kw = grid_kw_input * grid_scale
+        # Szenarien-Speicherung
+        st.button('Konfiguration speichern', on_click=lambda: save_configuration(pv_scale, ev_scale, configs, grid_kw))
 
-        # Solver
-        free_results = [solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, set_progress) for cfg in configs]
-        obj_joint, chs_joint, dhs_joint = solve_joint(prices, pv, ev, configs, grid_kw, interval_h, set_progress)
+    # ── Tab 2: Upload ─────────────────────
+    with tab2:
+        st.markdown('### Datei-Upload')
+        price_file = st.file_uploader('Preisgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
+        pv_file    = st.file_uploader('PV-Lastgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
+        ev_file    = st.file_uploader('EV-Lastgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
 
-        # Einzeloptimierung anzeigen
-        st.subheader('Einzeloptimierung')
-        tot_free = sum(obj for obj, *_ in free_results)
-        for idx,(cfg,(obj,_,_)) in enumerate(zip(configs, free_results), start=1):
-            st.metric(f"B{idx} ({cfg['mode']})", fmt_euro(obj))
-        st.metric('Gesamt Free', fmt_euro(tot_free))
+        if price_file and pv_file and ev_file:
+            p_df = load_price_df(price_file)
+            pv_df = load_pv_df(pv_file)
+            ev_df = load_ev_df(ev_file)
+            valid, msg = validate_data(p_df, pv_df, ev_df)
+            if valid:
+                st.success("Dateien erfolgreich geladen und validiert.")
+                ts_all = p_df['Zeitstempel']
+                st.metric('Zeitpunkte gesamt', f"{len(ts_all)}")
+                interval = ts_all.diff().dropna().mode()[0].total_seconds()/3600.0
+                st.metric('Intervall (h)', f"{interval:.2f}")
+            else:
+                st.error(msg)
 
-        # Gemeinsam
-        st.subheader('Gemeinsam')
-        st.metric('Gesamt', fmt_euro(obj_joint))
-        for idx in range(len(configs)):
-            share = float(np.dot(prices, dhs_joint[idx] - chs_joint[idx]))
-            st.metric(f"B{idx+1} Anteil", fmt_euro(share))
+    # ── Tab 3: Simulation & Ergebnisse ─────
+    with tab3:
+        st.markdown('### Simulation und Ergebnis-Vergleich')
+        price_file = st.sidebar.file_uploader('Preise', type=['csv','xls','xlsx'], key='sidebarpf')
+        pv_file    = st.sidebar.file_uploader('PV-Last', type=['csv','xls','xlsx'], key='sidebarpv')
+        ev_file    = st.sidebar.file_uploader('EV-Last', type=['csv','xls','xlsx'], key='sidebarev')
+        if st.button('▶️ Simulation starten'):
+            if not(price_file and pv_file and ev_file):
+                st.error('Bitte alle Dateien hochladen.')
+            else:
+                p_df = load_price_df(price_file)
+                pv_df = load_pv_df(pv_file)
+                ev_df = load_ev_df(ev_file)
+                valid, msg = validate_data(p_df, pv_df, ev_df)
+                if not valid:
+                    st.error(msg)
+                    st.stop()
+                ts = p_df['Zeitstempel']
+                prices = p_df['Preis_€/MWh'].to_numpy() / 1000.0
+                pv = pv_df['PV_kWh'].to_numpy() * pv_scale
+                ev = ev_df['EV_kWh'].to_numpy() * ev_scale
+                interval_h = ts.diff().dropna().mode()[0].total_seconds() / 3600.0
+                st.info(f'Intervall: {interval_h:.2f} h')
+                # Optimierung
+                free_results = [solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, set_progress) for cfg in configs]
+                obj_joint, chs_joint, dhs_joint = solve_joint(prices, pv, ev, configs, grid_kw, interval_h, set_progress)
+                # Einzeloptimierung anzeigen
+                st.subheader('Einzeloptimierung')
+                tot_free = sum(obj for obj, *_ in free_results)
+                for idx,(cfg,(obj,*,*)) in enumerate(zip(configs, free_results), start=1):
+                    st.metric(f"B{idx} ({cfg['mode']})", fmt_euro(obj))
+                st.metric('Gesamt Free', fmt_euro(tot_free))
+                # Joint
+                st.subheader('Gemeinsam')
+                st.metric('Gesamterlös', fmt_euro(obj_joint))
+                for idx in range(len(configs)):
+                    share = float(np.dot(prices, dhs_joint[idx] - chs_joint[idx]))
+                    st.metric(f"B{idx+1} Anteil", fmt_euro(share))
+                # Vergleich
+                delta = obj_joint - tot_free
+                pct = (delta/abs(tot_free)*100) if tot_free!=0 else 0
+                st.subheader('Vergleich')
+                d1,d2,d3 = st.columns(3)
+                d1.metric('Δ absolut', fmt_euro(delta))
+                d2.metric('Δ %', f"{pct:.2f}%")
+                net_load = pv + ev + sum(chs_joint) - sum(dhs_joint)
+                util = np.mean(net_load/(grid_kw*interval_h))*100
+                d3.metric('Netzauslastung', f"{util:.1f}%")
+                viol = (net_load > grid_kw*interval_h).sum()
+                if viol > 0:
+                    st.warning(f"⚠️ {viol} Überlastungen im Netz")
+                # Ergebnisse-Tabelle & Download
+                st.subheader('Ergebnisse / Export')
+                out = pd.DataFrame({
+                    'Zeit': ts,
+                    'Preis_€/kWh': prices,
+                    'PV_kWh': pv,
+                    'EV_kWh': ev
+                })
+                for idx in range(len(configs)):
+                    out[f'B{idx+1}_Laden_kWh'] = chs_joint[idx]
+                    out[f'B{idx+1}_Entladen_kWh'] = dhs_joint[idx]
+                out['Netzlast_kWh'] = net_load
+                out['Netzlast_%'] = net_load/(grid_kw*interval_h)*100
+                st.dataframe(out)
+                buf = BytesIO()
+                out.to_excel(buf, index=False, engine='openpyxl')
+                buf.seek(0)
+                st.download_button(
+                    '📥 Excel-Export', buf,
+                    file_name=f"res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
 
-        # Vergleich
-        delta = obj_joint - tot_free
-        pct   = (delta/abs(tot_free)*100) if tot_free!=0 else 0
-        st.subheader('Vergleich')
-        d1,d2,d3 = st.columns(3)
-        d1.metric('Δ absolut', fmt_euro(delta))
-        d2.metric('Δ %', f"{pct:.2f}%")
-        net_load = pv + ev + sum(chs_joint) - sum(dhs_joint)
-        util     = np.mean(net_load/(grid_kw*interval_h))*100
-        d3.metric('Netzauslastung', f"{util:.1f}%")
+def save_configuration(pv_scale, ev_scale, configs, grid_kw):
+    config = {
+        'timestamp': pd.Timestamp.now().isoformat(),
+        'pv_scale': pv_scale,
+        'ev_scale': ev_scale,
+        'batteries': configs,
+        'grid_kw': grid_kw
+    }
+    json_str = json.dumps(config, indent=2)
+    st.download_button(
+        '💾 Konfiguration als JSON speichern',
+        json_str,
+        file_name=f"BESS_Config_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.json",
+        mime='application/json'
+    )
 
-        # Ergebnisse-Tabelle & Export
-        st.subheader('Ergebnisse')
-        out = pd.DataFrame({
-            'Zeit': ts,
-            'Preis_€/kWh': prices,
-            'PV_kWh': pv,
-            'EV_kWh': ev
-        })
-        for idx in range(len(configs)):
-            out[f'B{idx+1}_Laden_kWh']   = chs_joint[idx]
-            out[f'B{idx+1}_Entladen_kWh'] = dhs_joint[idx]
-        out['Netzlast_kWh'] = net_load
-        out['Netzlast_%']   = net_load/(grid_kw*interval_h)*100
-        viol = (net_load > grid_kw*interval_h).sum()
-        if viol>0:
-            st.warning(f"⚠️ {viol} Überlastungen im Netz")
-        st.dataframe(out)
-
-        buf = BytesIO()
-        out.to_excel(buf, index=False, engine='openpyxl')
-        buf.seek(0)
-        st.download_button(
-            '📥 Excel-Export', buf,
-            file_name=f"res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
+if __name__ == '__main__':
+    main()
