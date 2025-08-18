@@ -129,7 +129,7 @@ def solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, progress=None):
             progress(5 + int(45 * t / T))
     m += pulp.lpSum((ch[t] + dh[t]) / (2 * cap) for t in range(T)) <= max_cyc
     if progress: progress(50)
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=120)
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=300)  # Erhöht auf 5 Minuten
     status = solver.solve(m)
     if progress: progress(90)
     if status != pulp.LpStatusOptimal:
@@ -173,7 +173,7 @@ def solve_joint(prices, pv, ev, cfgs, grid_kw, interval_h, progress=None):
     for i in range(n):
         m += pulp.lpSum((ch_vars[i][t] + dh_vars[i][t]) / (2 * caps[i]) for t in range(T)) <= max_cyc[i]
     if progress: progress(50)
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=120)
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=300)  # Erhöht auf 5 Minuten
     status = solver.solve(m)
     if progress: progress(90)
     if status != pulp.LpStatusOptimal:
@@ -493,190 +493,192 @@ def main():
                 # Eigenverbrauchsdeckungs-Analyse (viertelstündlich korrekt)
                 st.subheader('🏠 Eigenverbrauchsdeckungs-Analyse')
                 
-                # Viertelstündliche Eigenverbrauchsberechnung
-                # Für jeden Zeitpunkt prüfen: PV → Batterie → Netz Hierarchie
-                pv_to_ev_direct = np.zeros(len(pv))
-                batt_to_ev = np.zeros(len(pv))
-                grid_to_ev = np.zeros(len(pv))
-                
-                total_batt_output = sum(dhs_joint)  # Gesamte Batterieentladung
-                
-                for t in range(len(pv)):
-                    ev_demand_t = ev[t]  # EV-Bedarf zu Zeitpunkt t
-                    pv_available_t = pv[t]  # PV-Erzeugung zu Zeitpunkt t
-                    batt_available_t = total_batt_output[t]  # Batterie-Output zu Zeitpunkt t
+                # Prüfe ob genug Daten vorhanden
+                if len(pv) > 0 and len(ev) > 0:
+                    # Viertelstündliche Eigenverbrauchsberechnung
+                    # Für jeden Zeitpunkt prüfen: PV → Batterie → Netz Hierarchie
+                    pv_to_ev_direct = np.zeros(len(pv))
+                    batt_to_ev = np.zeros(len(pv))
+                    grid_to_ev = np.zeros(len(pv))
                     
-                    # 1. PV deckt direkt EV-Bedarf
-                    pv_direct = min(pv_available_t, ev_demand_t)
-                    pv_to_ev_direct[t] = pv_direct
-                    remaining_ev = ev_demand_t - pv_direct
+                    total_batt_output = sum(dhs_joint)  # Gesamte Batterieentladung
                     
-                    # 2. Batterie deckt restlichen EV-Bedarf
-                    if remaining_ev > 0:
-                        batt_contribution = min(batt_available_t, remaining_ev)
-                        batt_to_ev[t] = batt_contribution
-                        remaining_ev -= batt_contribution
-                    
-                    # 3. Netz deckt final verbleibenden Bedarf
-                    if remaining_ev > 0:
-                        grid_to_ev[t] = remaining_ev
-                
-                # Gesamtsummen
-                total_pv_to_ev = pv_to_ev_direct.sum()
-                total_batt_to_ev = batt_to_ev.sum()  
-                total_grid_to_ev = grid_to_ev.sum()
-                total_ev_demand = ev.sum()
-                
-                # Tortendiagramm-Daten für Streamlit
-                if total_ev_demand > 0:
-                    pie_data = pd.DataFrame({
-                        'Energiequelle': ['🌞 PV-Direktversorgung', '🔋 Batterie-Versorgung', '🔌 Netzbezug'],
-                        'MWh': [total_pv_to_ev/1000, total_batt_to_ev/1000, total_grid_to_ev/1000],
-                        'Anteil_%': [
-                            (total_pv_to_ev/total_ev_demand)*100,
-                            (total_batt_to_ev/total_ev_demand)*100, 
-                            (total_grid_to_ev/total_ev_demand)*100
-                        ]
-                    })
-                    
-                    st.markdown("#### 🥧 EV-Eigenverbrauchsdeckung")
-                    
-                    # Streamlit native pie chart alternative (bar chart)
-                    st.bar_chart(
-                        data=pie_data.set_index('Energiequelle')['MWh'],
-                        height=400
-                    )
-                    
-                    # Zusätzliche Tabelle für genaue Werte
-                    st.dataframe(
-                        pie_data.style.format({
-                            'MWh': '{:.1f}',
-                            'Anteil_%': '{:.1f}%'
-                        }),
-                        hide_index=True
-                    )
-                
-                # Detaillierte Zahlen zur Eigenverbrauchsdeckung
-                st.markdown("#### 📊 Detaillierte Eigenverbrauchsstatistik")
-                
-                # Autarkie-Grade berechnen (robuste Division)
-                if total_ev_demand > 0:
-                    ev_autarkie = ((total_pv_to_ev + total_batt_to_ev) / total_ev_demand * 100)
-                    pv_autarkie_ev = (total_pv_to_ev / total_ev_demand * 100)
-                    batt_contribution = (total_batt_to_ev / total_ev_demand * 100)
-                    grid_dependency = (total_grid_to_ev / total_ev_demand * 100)
-                else:
-                    ev_autarkie = pv_autarkie_ev = batt_contribution = grid_dependency = 0
-                
-                # Wirtschaftlichkeits-Metriken
-                total_pv = pv.sum()
-                if total_pv > 0:
-                    # PV für Direktverbrauch + Batterieladung
-                    pv_eigenverbrauch = total_pv_to_ev + sum(chs_joint).sum()  
-                    pv_eigenverbrauchsquote = (pv_eigenverbrauch / total_pv * 100)
-                else:
-                    pv_eigenverbrauchsquote = 0
-                
-                autarkie_cols = st.columns(2)
-                
-                with autarkie_cols[0]:
-                    st.markdown("##### 🎯 Autarkie-Grade")
-                    st.metric("🔋 Gesamt-Autarkie EV", f"{ev_autarkie:.1f}%")
-                    st.metric("🌞 PV-Direktversorgung", f"{pv_autarkie_ev:.1f}%") 
-                    st.metric("⚡ Batterie-Beitrag", f"{batt_contribution:.1f}%")
-                    st.metric("🔌 Netzbezugs-Anteil", f"{grid_dependency:.1f}%")
-                    
-                with autarkie_cols[1]:
-                    st.markdown("##### 💰 Wirtschaftlichkeits-Kennzahlen")
-                    st.metric("🏠 PV-Eigenverbrauchsquote", f"{pv_eigenverbrauchsquote:.1f}%")
-                    st.metric("📈 Eingesparte Netzbezugs-MWh", f"{(total_pv_to_ev + total_batt_to_ev)/1000:.1f}")
-                    
-                    # Zusätzliche Batterie-Effizienz
-                    total_charge = sum(chs_joint).sum()
-                    total_discharge = sum(dhs_joint).sum()
-                    if total_charge > 0:
-                        batt_efficiency = (total_discharge / total_charge * 100)
-                        st.metric("🔄 Batterie-Gesamteffizienz", f"{batt_efficiency:.1f}%")
-                    else:
-                        st.metric("🔄 Batterie-Gesamteffizienz", "0.0%")
-                    
-                    # Batterie-Zyklen berechnen (robuste Division by Zero Vermeidung)
-                    cycles_used = 0
-                    for i, cfg in enumerate(configs):
-                        if cfg['cap'] > 0:
-                            cycles_used += (chs_joint[i].sum() + dhs_joint[i].sum()) / (2 * cfg['cap'])
-                    st.metric("🔄 Batterie-Zyklen genutzt", f"{cycles_used:.1f}")
-                
-                # Monatliche Aufteilung für detailliertere Analyse
-                st.markdown("#### 📅 Monatliche Eigenverbrauchsdeckung")
-                
-                # Sichere Monatliche Gruppierung
-                try:
-                    analysis_df['Monat'] = analysis_df['Zeit'].dt.to_period('M')
-                    monthly_stats = analysis_df.groupby('Monat').agg({
-                        'PV_Erzeugung': 'sum',
-                        'EV_Verbrauch': 'sum', 
-                        'Batt_Laden': 'sum',
-                        'Batt_Entladen': 'sum'
-                    }).reset_index()
-                    
-                    if not monthly_stats.empty:
-                        monthly_stats['Monat_str'] = monthly_stats['Monat'].astype(str)
+                    for t in range(len(pv)):
+                        ev_demand_t = ev[t]  # EV-Bedarf zu Zeitpunkt t
+                        pv_available_t = pv[t]  # PV-Erzeugung zu Zeitpunkt t
+                        batt_available_t = total_batt_output[t]  # Batterie-Output zu Zeitpunkt t
                         
-                        # Monatliche PV-Direktdeckung viertelstündlich korrekt berechnen
-                        monthly_direct_pv = []
-                        for month_period in monthly_stats['Monat']:
-                            mask = analysis_df['Monat'] == month_period
-                            month_pv = analysis_df.loc[mask, 'PV_Erzeugung'].values
-                            month_ev = analysis_df.loc[mask, 'EV_Verbrauch'].values
-                            # Viertelstündlich minimum nehmen und summieren
-                            direct_pv = np.minimum(month_pv, month_ev).sum()
-                            monthly_direct_pv.append(direct_pv)
+                        # 1. PV deckt direkt EV-Bedarf
+                        pv_direct = min(pv_available_t, ev_demand_t)
+                        pv_to_ev_direct[t] = pv_direct
+                        remaining_ev = ev_demand_t - pv_direct
                         
-                        monthly_stats['PV_Direktdeckung'] = monthly_direct_pv
+                        # 2. Batterie deckt restlichen EV-Bedarf
+                        if remaining_ev > 0:
+                            batt_contribution = min(batt_available_t, remaining_ev)
+                            batt_to_ev[t] = batt_contribution
+                            remaining_ev -= batt_contribution
                         
-                        # Robuste Autarkie-Berechnung
-                        monthly_stats['Autarkie_%'] = 0.0
-                        mask_nonzero = monthly_stats['EV_Verbrauch'] > 0
-                        monthly_stats.loc[mask_nonzero, 'Autarkie_%'] = (
-                            (monthly_stats.loc[mask_nonzero, 'PV_Direktdeckung'] + 
-                             monthly_stats.loc[mask_nonzero, 'Batt_Entladen']) / 
-                            monthly_stats.loc[mask_nonzero, 'EV_Verbrauch'] * 100
-                        )
-                        
-                        # Monatliches Säulendiagramm mit Streamlit
-                        st.markdown("**Monatliche Energie-Bilanz (MWh)**")
-                        
-                        monthly_chart_data = monthly_stats.set_index('Monat_str')
-                        monthly_chart_data = monthly_chart_data.rename(columns={
-                            'PV_Erzeugung': '🌞 PV-Erzeugung (MWh)',
-                            'EV_Verbrauch': '🚗 EV-Verbrauch (MWh)', 
-                            'Batt_Entladen': '🔋 Batterie-Output (MWh)'
+                        # 3. Netz deckt final verbleibenden Bedarf
+                        if remaining_ev > 0:
+                            grid_to_ev[t] = remaining_ev
+                    
+                    # Gesamtsummen
+                    total_pv_to_ev = pv_to_ev_direct.sum()
+                    total_batt_to_ev = batt_to_ev.sum()  
+                    total_grid_to_ev = grid_to_ev.sum()
+                    total_ev_demand = ev.sum()
+                    
+                    # Tortendiagramm-Daten für Streamlit
+                    if total_ev_demand > 0:
+                        pie_data = pd.DataFrame({
+                            'Energiequelle': ['🌞 PV-Direktversorgung', '🔋 Batterie-Versorgung', '🔌 Netzbezug'],
+                            'MWh': [total_pv_to_ev/1000, total_batt_to_ev/1000, total_grid_to_ev/1000],
+                            'Anteil_%': [
+                                (total_pv_to_ev/total_ev_demand)*100,
+                                (total_batt_to_ev/total_ev_demand)*100, 
+                                (total_grid_to_ev/total_ev_demand)*100
+                            ]
                         })
                         
-                        # Auf MWh umrechnen
-                        for col in ['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']:
-                            monthly_chart_data[col] = monthly_chart_data[col] / 1000
+                        st.markdown("#### 🥧 EV-Eigenverbrauchsdeckung")
                         
+                        # Streamlit native pie chart alternative (bar chart)
                         st.bar_chart(
-                            data=monthly_chart_data[['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']],
+                            data=pie_data.set_index('Energiequelle')['MWh'],
                             height=400
                         )
                         
-                        # Zusätzlich: Monatliche Autarkie-Tabelle
-                        st.markdown("**Monatliche Autarkie-Grade**")
-                        autarkie_display = monthly_stats[['Monat_str', 'Autarkie_%']].copy()
-                        autarkie_display.columns = ['Monat', 'Autarkie (%)']
+                        # Zusätzliche Tabelle für genaue Werte
                         st.dataframe(
-                            autarkie_display.style.format({'Autarkie (%)': '{:.1f}%'}),
+                            pie_data.style.format({
+                                'MWh': '{:.1f}',
+                                'Anteil_%': '{:.1f}%'
+                            }),
                             hide_index=True
                         )
                         
-                except Exception as e:
-                    st.warning(f"⚠️ Monatliche Auswertung konnte nicht erstellt werden: {str(e)}")
+                        # Detaillierte Zahlen zur Eigenverbrauchsdeckung
+                        st.markdown("#### 📊 Detaillierte Eigenverbrauchsstatistik")
+                        
+                        # Autarkie-Grade berechnen (robuste Division)
+                        ev_autarkie = ((total_pv_to_ev + total_batt_to_ev) / total_ev_demand * 100)
+                        pv_autarkie_ev = (total_pv_to_ev / total_ev_demand * 100)
+                        batt_contribution = (total_batt_to_ev / total_ev_demand * 100)
+                        grid_dependency = (total_grid_to_ev / total_ev_demand * 100)
+                        
+                        # Wirtschaftlichkeits-Metriken
+                        total_pv = pv.sum()
+                        if total_pv > 0:
+                            # PV für Direktverbrauch + Batterieladung
+                            pv_eigenverbrauch = total_pv_to_ev + sum(chs_joint).sum()  
+                            pv_eigenverbrauchsquote = (pv_eigenverbrauch / total_pv * 100)
+                        else:
+                            pv_eigenverbrauchsquote = 0
+                        
+                        autarkie_cols = st.columns(2)
+                        
+                        with autarkie_cols[0]:
+                            st.markdown("##### 🎯 Autarkie-Grade")
+                            st.metric("🔋 Gesamt-Autarkie EV", f"{ev_autarkie:.1f}%")
+                            st.metric("🌞 PV-Direktversorgung", f"{pv_autarkie_ev:.1f}%") 
+                            st.metric("⚡ Batterie-Beitrag", f"{batt_contribution:.1f}%")
+                            st.metric("🔌 Netzbezugs-Anteil", f"{grid_dependency:.1f}%")
+                            
+                        with autarkie_cols[1]:
+                            st.markdown("##### 💰 Wirtschaftlichkeits-Kennzahlen")
+                            st.metric("🏠 PV-Eigenverbrauchsquote", f"{pv_eigenverbrauchsquote:.1f}%")
+                            st.metric("📈 Eingesparte Netzbezugs-MWh", f"{(total_pv_to_ev + total_batt_to_ev)/1000:.1f}")
+                            
+                            # Zusätzliche Batterie-Effizienz
+                            total_charge = sum(chs_joint).sum()
+                            total_discharge = sum(dhs_joint).sum()
+                            if total_charge > 0:
+                                batt_efficiency = (total_discharge / total_charge * 100)
+                                st.metric("🔄 Batterie-Gesamteffizienz", f"{batt_efficiency:.1f}%")
+                            else:
+                                st.metric("🔄 Batterie-Gesamteffizienz", "0.0%")
+                            
+                            # Batterie-Zyklen berechnen (robuste Division by Zero Vermeidung)
+                            cycles_used = 0
+                            for i, cfg in enumerate(configs):
+                                if cfg['cap'] > 0:
+                                    cycles_used += (chs_joint[i].sum() + dhs_joint[i].sum()) / (2 * cfg['cap'])
+                            st.metric("🔄 Batterie-Zyklen genutzt", f"{cycles_used:.1f}")
+                        
+                        # Monatliche Aufteilung für detailliertere Analyse
+                        st.markdown("#### 📅 Monatliche Eigenverbrauchsdeckung")
+                        
+                        # Sichere Monatliche Gruppierung
+                        try:
+                            analysis_df['Monat'] = analysis_df['Zeit'].dt.to_period('M')
+                            monthly_stats = analysis_df.groupby('Monat').agg({
+                                'PV_Erzeugung': 'sum',
+                                'EV_Verbrauch': 'sum', 
+                                'Batt_Laden': 'sum',
+                                'Batt_Entladen': 'sum'
+                            }).reset_index()
+                            
+                            if not monthly_stats.empty:
+                                monthly_stats['Monat_str'] = monthly_stats['Monat'].astype(str)
+                                
+                                # Monatliche PV-Direktdeckung viertelstündlich korrekt berechnen
+                                monthly_direct_pv = []
+                                for month_period in monthly_stats['Monat']:
+                                    mask = analysis_df['Monat'] == month_period
+                                    month_pv = analysis_df.loc[mask, 'PV_Erzeugung'].values
+                                    month_ev = analysis_df.loc[mask, 'EV_Verbrauch'].values
+                                    # Viertelstündlich minimum nehmen und summieren
+                                    direct_pv = np.minimum(month_pv, month_ev).sum()
+                                    monthly_direct_pv.append(direct_pv)
+                                
+                                monthly_stats['PV_Direktdeckung'] = monthly_direct_pv
+                                
+                                # Robuste Autarkie-Berechnung
+                                monthly_stats['Autarkie_%'] = 0.0
+                                mask_nonzero = monthly_stats['EV_Verbrauch'] > 0
+                                monthly_stats.loc[mask_nonzero, 'Autarkie_%'] = (
+                                    (monthly_stats.loc[mask_nonzero, 'PV_Direktdeckung'] + 
+                                     monthly_stats.loc[mask_nonzero, 'Batt_Entladen']) / 
+                                    monthly_stats.loc[mask_nonzero, 'EV_Verbrauch'] * 100
+                                )
+                                
+                                # Monatliches Säulendiagramm mit Streamlit
+                                st.markdown("**Monatliche Energie-Bilanz (MWh)**")
+                                
+                                monthly_chart_data = monthly_stats.set_index('Monat_str')
+                                monthly_chart_data = monthly_chart_data.rename(columns={
+                                    'PV_Erzeugung': '🌞 PV-Erzeugung (MWh)',
+                                    'EV_Verbrauch': '🚗 EV-Verbrauch (MWh)', 
+                                    'Batt_Entladen': '🔋 Batterie-Output (MWh)'
+                                })
+                                
+                                # Auf MWh umrechnen
+                                for col in ['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']:
+                                    monthly_chart_data[col] = monthly_chart_data[col] / 1000
+                                
+                                st.bar_chart(
+                                    data=monthly_chart_data[['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']],
+                                    height=400
+                                )
+                                
+                                # Zusätzlich: Monatliche Autarkie-Tabelle
+                                st.markdown("**Monatliche Autarkie-Grade**")
+                                autarkie_display = monthly_stats[['Monat_str', 'Autarkie_%']].copy()
+                                autarkie_display.columns = ['Monat', 'Autarkie (%)']
+                                st.dataframe(
+                                    autarkie_display.style.format({'Autarkie (%)': '{:.1f}%'}),
+                                    hide_index=True
+                                )
+                                
+                        except Exception as e:
+                            st.warning(f"⚠️ Monatliche Auswertung konnte nicht erstellt werden: {str(e)}")
                     
-            else:
-                st.warning("⚠️ Keine gültigen Daten für Eigenverbrauchsanalyse verfügbar.")
+                    else:
+                        st.warning("⚠️ Kein EV-Verbrauch gefunden - Eigenverbrauchsanalyse nicht möglich.")
+                        
+                else:
+                    st.warning("⚠️ Keine gültigen Daten für Eigenverbrauchsanalyse verfügbar.")
                     
             except Exception as e:
                 st.error(f"❌ Fehler bei der Simulation: {str(e)}")
