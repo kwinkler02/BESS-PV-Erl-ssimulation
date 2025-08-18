@@ -104,7 +104,7 @@ def validate_data_ev(pv_df, ev_df):
 # Ziel: min Σ grid_ev + ε·Σ pv_curt
 # ─────────────────────────────────────────────────────────────
 
-def solve_ev_only(pv, ev, cfg, grid_kw, interval_h, progress=None, eps_curt=1e-6):
+def solve_ev_only(pv, ev, cfg, grid_kw, interval_h, progress=None, eps_curt=1e-6, bigM_shed=1e6):
     T = len(pv)
     cap = cfg['cap']
     eff = cfg['eff_pct'] ** 0.5
@@ -118,32 +118,30 @@ def solve_ev_only(pv, ev, cfg, grid_kw, interval_h, progress=None, eps_curt=1e-6
 
     m = pulp.LpProblem('EV_ONLY', pulp.LpMinimize)
 
-    # Variablen
-    c  = pulp.LpVariable.dicts('c',  range(T), cat='Binary')
-    d  = pulp.LpVariable.dicts('d',  range(T), cat='Binary')
+    # Variablen (ohne Binärvariablen → LP, stabiler)
     ch_pv  = pulp.LpVariable.dicts('ch_pv',  range(T), lowBound=0, upBound=pmax)
     dh_ev  = pulp.LpVariable.dicts('dh_ev',  range(T), lowBound=0, upBound=pmax)
     pv_grid= pulp.LpVariable.dicts('pv_grid',range(T), lowBound=0, upBound=gmax)
     grid_ev= pulp.LpVariable.dicts('grid_ev',range(T), lowBound=0, upBound=gmax)
     pv_curt= pulp.LpVariable.dicts('pv_curt',range(T), lowBound=0)
+    ev_short= pulp.LpVariable.dicts('ev_short',range(T), lowBound=0)  # weiche EV-Deckung, nur wenn zwingend
     soc    = pulp.LpVariable.dicts('soc',    range(T), lowBound=0, upBound=cap)
 
-    # Ziel: Netzbezug minimieren + winzige Strafe für Curtailment
-    m += pulp.lpSum(grid_ev[t] + eps_curt*pv_curt[t] for t in range(T))
+    # Ziel: Netzbezug minimieren + starke Strafe für EV-Undeckung + kleine Strafe für Curtailment
+    m += pulp.lpSum(grid_ev[t] + bigM_shed*ev_short[t] + eps_curt*pv_curt[t] for t in range(T))
 
     for t in range(T):
-        # Power & keine Gleichzeitigkeit
-        m += c[t] + d[t] <= 1
-        m += ch_pv[t] <= pmax * c[t]
-        m += dh_ev[t] <= pmax * d[t]
-
         # Aufteilung Überschüsse/Bedarfe
         m += ch_pv[t] + pv_grid[t] + pv_curt[t] == float(pv_sur[t])
-        m += dh_ev[t] + grid_ev[t] == float(ev_res[t])
+        m += dh_ev[t] + grid_ev[t] + ev_short[t] == float(ev_res[t])
 
         # SoC-Dynamik
         prev = cfg['start_soc'] if t == 0 else soc[t-1]
         m += soc[t] == prev + eff * ch_pv[t] - dh_ev[t] / eff
+
+        # Leistungslimits
+        m += ch_pv[t] <= pmax
+        m += dh_ev[t] <= pmax
 
         # Netzanschluss je Richtung
         m += pv_grid[t] <= gmax
@@ -160,23 +158,6 @@ def solve_ev_only(pv, ev, cfg, grid_kw, interval_h, progress=None, eps_curt=1e-6
 
     if status != pulp.LpStatusOptimal:
         return {'status': pulp.LpStatus[status]}
-
-    to_arr = lambda X: np.array([X[t].value() or 0.0 for t in range(T)])
-    return {
-        'status': 'Optimal',
-        'pv_ev': pv_ev,
-        'pv_sur': pv_sur,
-        'ev_res': ev_res,
-        'ch_pv': to_arr(ch_pv),
-        'dh_ev': to_arr(dh_ev),
-        'pv_grid': to_arr(pv_grid),
-        'grid_ev': to_arr(grid_ev),
-        'pv_curt': to_arr(pv_curt),
-        'soc': to_arr(soc),
-        'cycles': float(((to_arr(ch_pv) + to_arr(dh_ev)) / (2*cap)).sum()) if cap>0 else 0.0,
-        'obj_min_grid': float(pulp.value(m.objective) or 0.0)
-    }
-
 # ── Session State Initialisierung ───────────────────
 def init_session_state():
     if 'progress_bar' not in st.session_state:
@@ -313,7 +294,14 @@ def main():
                 pv_grid    = res['pv_grid']
                 grid_ev    = res['grid_ev']
                 pv_curt    = res['pv_curt']
+                ev_short   = res['ev_short']
                 soc        = res['soc']
+
+                # Physikalische Unterdeckungs-Untergrenze (nur durch Limits pmax+gmax bedingt)
+                pmax = cfg['bat_kw'] * interval_h
+                gmax = grid_kw * interval_h
+                ev_short_lb = np.maximum(0, ev_res - (gmax + pmax))
+                ev_short_lb_tot = ev_short_lb.sum()
 
                 # Kennzahlen
                 ev_total = ev.sum()
@@ -330,6 +318,10 @@ def main():
                 pv_selfuse = ev_from_pv + ch_pv.sum()
                 pv_selfuse_q = (pv_selfuse / pv_total * 100) if pv_total>0 else 0.0
 
+                # Unterschreitung (falls Netzlimit + Batteriepower/SoC nicht reichen)
+                ev_short_tot = ev_short.sum()
+                short_steps = int((ev_short > 1e-6).sum())
+
                 m1, m2, m3, m4, m5 = st.columns(5)
                 with m1: st.metric('EV-Autarkie', f"{autarkie_ev:.1f}%")
                 with m2: st.metric('PV→EV (MWh)', f"{ev_from_pv/1000:.1f}")
@@ -344,6 +336,11 @@ def main():
                 with m9: st.metric('PV-Eigenverbrauchsquote', f"{pv_selfuse_q:.1f}%")
                 with m10: st.metric('Zyklen genutzt', f"{res['cycles']:.1f}")
 
+                if ev_short_tot > 1e-6:
+                    st.error(f"⚠️ EV nicht vollständig gedeckt: {ev_short_tot/1000:.2f} MWh in {short_steps} Zeitschritten (Netzlimit + Batteriepower/SoC reichen dort nicht).")
+                if ev_short_lb_tot > 1e-6:
+                    st.info(f"ℹ️ Physikalische Unterdeckungs-Untergrenze: mind. {ev_short_lb_tot/1000:.2f} MWh, weil EV_Rest > pmax+gmax in manchen Schritten.")
+
                 # Zeitreihen-DF
                 results_df = pd.DataFrame({
                     'Zeit': ts,
@@ -357,24 +354,28 @@ def main():
                     'PV_Export_kWh': pv_grid,
                     'EV_aus_Netz_kWh': grid_ev,
                     'PV_Curtail_kWh': pv_curt,
+                    'EV_unterdeckt_kWh': ev_short,
+                    'EV_unterdeckt_LB_kWh': ev_short_lb,
                     'SoC_kWh': soc
                 })
 
                 st.markdown('#### Zeitreihen (Ausschnitt)')
                 st.dataframe(results_df.head(200))
 
-                # Quartalsaggregation (Import/Export)
+                # Quartalsaggregation (Zusammenfassung)
                 results_df['Quartal'] = results_df['Zeit'].dt.to_period('Q')
                 q = results_df.groupby('Quartal').agg({
                     'EV_aus_Netz_kWh': 'sum',
                     'PV_Export_kWh': 'sum',
-                    'PV_Curtail_kWh': 'sum'
+                    'PV_Curtail_kWh': 'sum',
+                    'EV_unterdeckt_kWh': 'sum',
+                    'EV_unterdeckt_LB_kWh': 'sum'
                 }).reset_index()
                 if not q.empty:
                     q['Quartal_str'] = q['Quartal'].astype(str)
-                    st.markdown('#### Quartalsbilanz (MWh) – Netzbezug / Export / Curtail')
+                    st.markdown('#### Quartalsbilanz (MWh) – Netzbezug / Export / Curtail / Unterdeckung / Unterdeckung-LB')
                     chart_df = q.set_index('Quartal_str')/1000.0
-                    st.bar_chart(chart_df[['EV_aus_Netz_kWh','PV_Export_kWh','PV_Curtail_kWh']], height=300)
+                    st.bar_chart(chart_df[['EV_aus_Netz_kWh','PV_Export_kWh','PV_Curtail_kWh','EV_unterdeckt_kWh','EV_unterdeckt_LB_kWh']], height=300)
 
                 # Export
                 st.markdown('#### Export')
@@ -384,23 +385,3 @@ def main():
                 st.download_button('📥 Excel-Export', buf,
                     file_name=f"BESS_Single_Eigenverbrauch_{pd.Timestamp.now():%Y%m%d_%H%M%S}.xlsx",
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-            except Exception as e:
-                st.error(f"❌ Fehler bei der Simulation: {e}")
-                st.exception(e)
-
-# ── Konfiguration speichern ─────────────────────────
-def save_configuration(pv_scale, ev_scale, cfg, grid_kw):
-    config = {
-        'timestamp': pd.Timestamp.now().isoformat(),
-        'pv_scale': pv_scale,
-        'ev_scale': ev_scale,
-        'battery': cfg,
-        'grid_kw': grid_kw
-    }
-    json_str = json.dumps(config, indent=2)
-    st.download_button('💾 Konfiguration als JSON speichern', json_str,
-        file_name=f"BESS_Single_EVonly_Config_{pd.Timestamp.now():%Y%m%d_%H%M}.json", mime='application/json')
-
-if __name__ == '__main__':
-    main()
