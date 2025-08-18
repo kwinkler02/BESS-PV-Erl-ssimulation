@@ -124,7 +124,7 @@ def solve_ev_only(pv, ev, cfg, grid_kw, interval_h, progress=None, eps_curt=1e-6
     pv_grid= pulp.LpVariable.dicts('pv_grid',range(T), lowBound=0, upBound=gmax)
     grid_ev= pulp.LpVariable.dicts('grid_ev',range(T), lowBound=0, upBound=gmax)
     pv_curt= pulp.LpVariable.dicts('pv_curt',range(T), lowBound=0)
-    ev_short= pulp.LpVariable.dicts('ev_short',range(T), lowBound=0)  # weiche EV-Deckung, nur wenn zwingend
+    ev_short= pulp.LpVariable.dicts('ev_short',range(T), lowBound=0)  # weiche EV-Deckung
     soc    = pulp.LpVariable.dicts('soc',    range(T), lowBound=0, upBound=cap)
 
     # Ziel: Netzbezug minimieren + starke Strafe für EV-Undeckung + kleine Strafe für Curtailment
@@ -158,6 +158,35 @@ def solve_ev_only(pv, ev, cfg, grid_kw, interval_h, progress=None, eps_curt=1e-6
 
     if status != pulp.LpStatusOptimal:
         return {'status': pulp.LpStatus[status]}
+
+    # Erfolgsfall: Ergebnisse extrahieren
+    to_arr = lambda X: np.array([X[t].value() or 0.0 for t in range(T)])
+    ch_pv_v   = to_arr(ch_pv)
+    dh_ev_v   = to_arr(dh_ev)
+    pv_grid_v = to_arr(pv_grid)
+    grid_ev_v = to_arr(grid_ev)
+    pv_curt_v = to_arr(pv_curt)
+    ev_short_v= to_arr(ev_short)
+    soc_v     = to_arr(soc)
+
+    cycles = float(((ch_pv_v + dh_ev_v) / (2*cap)).sum()) if cap>0 else 0.0
+
+    return {
+        'status': 'Optimal',
+        'pv_ev': pv_ev,
+        'pv_sur': pv_sur,
+        'ev_res': ev_res,
+        'ch_pv': ch_pv_v,
+        'dh_ev': dh_ev_v,
+        'pv_grid': pv_grid_v,
+        'grid_ev': grid_ev_v,
+        'pv_curt': pv_curt_v,
+        'ev_short': ev_short_v,
+        'soc': soc_v,
+        'cycles': cycles,
+        'obj_min_grid': float(pulp.value(m.objective) or 0.0)
+    }
+
 # ── Session State Initialisierung ───────────────────
 def init_session_state():
     if 'progress_bar' not in st.session_state:
@@ -385,3 +414,23 @@ def main():
                 st.download_button('📥 Excel-Export', buf,
                     file_name=f"BESS_Single_Eigenverbrauch_{pd.Timestamp.now():%Y%m%d_%H%M%S}.xlsx",
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            except Exception as e:
+                st.error(f"❌ Fehler bei der Simulation: {e}")
+                st.exception(e)
+
+
+# ── Konfiguration speichern ─────────────────────────
+def save_configuration(pv_scale, ev_scale, cfg, grid_kw):
+    config = {
+        'timestamp': pd.Timestamp.now().isoformat(),
+        'pv_scale': pv_scale,
+        'ev_scale': ev_scale,
+        'battery': cfg,
+        'grid_kw': grid_kw
+    }
+    json_str = json.dumps(config, indent=2)
+    st.download_button('💾 Konfiguration als JSON speichern', json_str,
+        file_name=f"BESS_Single_EVonly_Config_{pd.Timestamp.now():%Y%m%d_%H%M}.json", mime='application/json')
+
+if __name__ == '__main__':
+    main()
