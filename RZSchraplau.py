@@ -1,343 +1,406 @@
-# BESS – Eigenverbrauchsmaximierung (ohne Day-Ahead)
-# -------------------------------------------------
-# Streamlit-App zur reinen Eigenverbrauchsoptimierung (EV-first)
-# - Keine Preis- oder Arbitrage-Logik
-# - Priorität: PV -> EV, dann Batterie (Laden/Entladen), Rest optional Export/Spill
-# - Robuste Zeitreihen-Verarbeitung (15-min / 60-min etc.)
-# - KPI-Ausgabe + Zeitreihen + Excel-Export (inkl. SoC)
-#
-# Hinweise zu Einheiten:
-# - PV, EV (Last) in kWh pro Zeitschritt
-# - Batterie: E_max in kWh, P_max in kW
-# - Zeitschritt Δt wird aus Zeitstempel abgeleitet (Median der Differenzen)
-# - RTE wird in η_c = η_d = sqrt(RTE) aufgeteilt
-#
-# Benötigte Dateien (jeweils .xlsx oder .csv):
-# - PV-Zeitreihe mit Spalten [timestamp, value]
-# - EV-Zeitreihe (Eigenverbrauchslastgang) mit Spalten [timestamp, value]
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+import pulp
 from io import BytesIO
-import math
+import locale
+import json
 
-# ────────────────────────────────────────────────────────────────────────────────
-# UI Setup
-# ────────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="BESS – EV-Only", page_icon="🔋", layout="wide")
+# ─────────────────────────────────────────────────────────────
+# Single-Battery · Eigenverbrauchsmaximierung (ohne Day-Ahead)
+# Stand: 18.08.2025
+# Logik (hinter dem Zähler, EV hat Vorrang):
+#   1) PV → EV (deterministisch)
+#   2) PV-Überschuss → Batterie laden (ch_pv) bis Power/SoC
+#   3) Batterie → EV (dh_ev) bis Power/SoC
+#   4) Rest-EV → Netzimport (grid_ev), Rest-PV → Netzausgang (pv_grid)
+#   5) PV-Curtailment (pv_curt) nur falls nötig (zur Vermeidung von Infeasible)
+# Ziel: Minimiere Σ grid_ev (Netzbezug für EV). Kleiner Zusatz: minimiere auch Curtailment (sehr kleine Gewichtung).
+# ─────────────────────────────────────────────────────────────
 
-# Session-State für Fortschritt
-if "progress_bar" not in st.session_state:
-    st.session_state.progress_bar = st.progress(0)
-if "progress_text" not in st.session_state:
-    st.session_state.progress_text = st.empty()
-
+# ── Fortschrittsanzeige ─────────────────────────────
 def set_progress(pct: int):
-    st.session_state.progress_bar.progress(min(max(int(pct), 0), 100))
-    st.session_state.progress_text.markdown(f"**Fortschritt:** {min(max(int(pct), 0), 100)}%")
+    st.session_state.progress_bar.progress(pct)
+    st.session_state.progress_text.markdown(f"**Fortschritt:** {pct}%")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Helper
-# ────────────────────────────────────────────────────────────────────────────────
+# ── Euro-Format (für evtl. spätere Erweiterung) ─────
+try:
+    locale.setlocale(locale.LC_ALL, 'de_DE.UTF-8')
+    def fmt_euro(x): return locale.currency(x, symbol=True, grouping=True)
+except locale.Error:
+    def fmt_euro(x): return f"{x:,.2f}".replace(",","X").replace(".",",").replace("X",".") + ' €'
 
-def read_timeseries(uploaded_file) -> pd.DataFrame:
-    """Liest .xlsx oder .csv mit Spalten [timestamp, value].
-    - Erkennt Zeitstempel-Spalte (erste Datum/Zeit-ähnliche Spalte) automatisch
-    - Erkennt Werte-Spalte (erste numerische Spalte) automatisch
-    - Normalisiert Spaltennamen auf ['ts', 'val'] und sortiert
-    """
-    if uploaded_file is None:
-        return pd.DataFrame(columns=["ts", "val"])  # leer
-
-    name = uploaded_file.name.lower()
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        df = pd.read_excel(uploaded_file)
-    else:
-        df = pd.read_csv(uploaded_file, sep=None, engine="python")
-
-    # Spalten auto-erkennen
-    ts_col = None
-    val_col = None
-    for col in df.columns:
-        if ts_col is None:
-            # Versuche, als Datum zu parsen
+# ── Flexibler Zeitstempel-Parser ────────────────────
+def parse_flexible_timestamp(ts_series):
+    parsed = []
+    for ts in ts_series:
+        if pd.isna(ts):
+            parsed.append(pd.NaT)
+            continue
+        s = str(ts).strip()
+        try:
+            parsed.append(pd.to_datetime(s, dayfirst=True))
+        except Exception:
             try:
-                pd.to_datetime(df[col])
-                ts_col = col
+                if '.' in s and len(s.split('.')[-1].split(' ')[0]) <= 2:
+                    parts = s.split('.')
+                    if len(parts) >= 2:
+                        y = parts[1].split(' ')
+                        if len(y) >= 1:
+                            yy = int(y[0])
+                            full = 2000 + yy if yy < 50 else 1900 + yy
+                            s = s.replace(f".{y[0]} ", f".{full} ")
+                parsed.append(pd.to_datetime(s, infer_datetime_format=True))
             except Exception:
-                pass
-        if val_col is None and np.issubdtype(df[col].dtype, np.number):
-            val_col = col
+                parsed.append(pd.NaT)
+    return pd.Series(parsed)
 
-    if ts_col is None:
-        # Fallback: erste Spalte parsen
-        ts_col = df.columns[0]
-        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-    else:
-        df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-
-    if val_col is None:
-        # Fallback: zweite Spalte
-        candidates = [c for c in df.columns if c != ts_col]
-        if not candidates:
-            raise ValueError("Keine Werte-Spalte gefunden.")
-        val_col = candidates[0]
-
-    df = df[[ts_col, val_col]].rename(columns={ts_col: "ts", val_col: "val"})
-    df = df.dropna(subset=["ts"]).copy()
-    # numerisch erzwingen, negative Rauschen cleanen
-    df["val"] = pd.to_numeric(df["val"], errors="coerce").fillna(0.0)
-    df = df.sort_values("ts").reset_index(drop=True)
-    return df
-
-
-def align_series(pv: pd.DataFrame, ev: pd.DataFrame) -> pd.DataFrame:
-    """Inner Join auf Zeitstempel, NaNs -> 0. Rückgabe: DataFrame mit Spalten pv, ev."""
-    if pv.empty or ev.empty:
-        return pd.DataFrame(columns=["ts", "pv", "ev"])  # leer
-    df = pd.merge(pv, ev, on="ts", how="inner", suffixes=("_pv", "_ev"))
-    df = df.rename(columns={"val_pv": "pv", "val_ev": "ev"})
-    df = df[["ts", "pv", "ev"]].copy()
-    df["pv"] = df["pv"].clip(lower=0)
-    df["ev"] = df["ev"].clip(lower=0)
-    return df
-
-
-def infer_dt_hours(ts: pd.Series) -> float:
-    """Δt in Stunden basierend auf Median der Zeitdifferenzen (robust ggü. DST)."""
-    if len(ts) < 2:
-        return 1.0  # Default 1h
-    d = pd.Series(ts).diff().dropna().dt.total_seconds() / 3600.0
-    med = float(d.median())
-    # Num. Stabilisierung (z. B. 0.249999 -> 0.25)
-    for target in [1/96, 0.25, 0.5, 1.0]:
-        if abs(med - target) < 1e-3:
-            return target
-    return med
-
-
-def simulate_ev_only(df: pd.DataFrame, E_kWh: float, P_kW: float, rte: float,
-                      soc0_perc: float, grid_imp_kW: float, grid_exp_kW: float,
-                      ts_is_period_end: bool = True) -> pd.DataFrame:
-    """Vorwärts-Simulation EV-first ohne Preise.
-
-    Args:
-        df: DataFrame mit Spalten [ts, pv, ev] (Energien je Intervall, kWh)
-        E_kWh: Batteriekapazität [kWh]
-        P_kW: max. Lade- und Entladeleistung [kW] (symmetrisch)
-        rte: Round-Trip-Effizienz in Dezimal (z. B. 0.92)
-        soc0_perc: Anfangs-SoC in % [0..100]
-        grid_imp_kW: Importlimit [kW]
-        grid_exp_kW: Exportlimit [kW]
-        ts_is_period_end: True, wenn Zeitstempel das Intervallende markieren
-
-    Returns:
-        DataFrame mit Flüssen und SoC.
-    """
-    df = df.copy()
-    if df.empty:
+# ── Generischer Daten-Loader ────────────────────────
+def load_generic_series(upl, col_name):
+    try:
+        upl.seek(0)
+        if upl.name.lower().endswith('.csv'):
+            try:
+                df = pd.read_csv(upl, sep=';', decimal=',', usecols=[0,1], header=0)
+            except Exception:
+                upl.seek(0)
+                df = pd.read_csv(upl, sep=',', decimal='.', usecols=[0,1], header=0)
+        else:
+            upl.seek(0)
+            df = pd.read_excel(upl, usecols=[0,1], engine='openpyxl', header=0)
+        if len(df.columns) < 2:
+            raise ValueError(f"Datei muss mindestens 2 Spalten haben, gefunden: {len(df.columns)}")
+        df.columns = ['Zeitstempel', col_name]
+        df['Zeitstempel'] = parse_flexible_timestamp(df['Zeitstempel'])
+        df[col_name] = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
+        if df.empty or df[col_name].isna().all():
+            raise ValueError(f"Keine gültigen Daten in {col_name} gefunden")
         return df
+    except Exception as e:
+        st.error(f"Fehler beim Laden der Datei {upl.name}: {str(e)}")
+        return pd.DataFrame()
 
-    dt_h = infer_dt_hours(df["ts"])  # Stunden
-    eta_c = eta_d = math.sqrt(max(min(rte, 0.999999), 0.0))  # Sicherheitskappung
+def load_pv_df(upl):    return load_generic_series(upl, 'PV_kWh')
+def load_ev_df(upl):    return load_generic_series(upl, 'EV_kWh')
 
-    # Ergebnis-Arrays
-    n = len(df)
-    pv_to_ev = np.zeros(n)
-    pv_to_ch = np.zeros(n)
-    pv_to_exp = np.zeros(n)
-    pv_spill  = np.zeros(n)
-    dis_to_ev = np.zeros(n)
-    imp_to_ev = np.zeros(n)
-    soc_arr   = np.zeros(n+1)
+# ── Datenvalidierung (nur PV & EV) ──────────────────
+def validate_data_ev(pv_df, ev_df):
+    for df, name in [(pv_df,'PV'), (ev_df,'EV')]:
+        if df.empty:
+            return False, f'{name}-Datei ist leer oder konnte nicht geladen werden'
+    lengths = [len(pv_df), len(ev_df)]
+    if lengths[0] != lengths[1]:
+        return False, f'Unterschiedliche Datenlängen: PV={lengths[0]}, EV={lengths[1]}'
+    for df, name in [(pv_df,'PV'), (ev_df,'EV')]:
+        if df['Zeitstempel'].isna().any():
+            return False, f"{name}: Zeitstempel fehlerhaft oder unvollständig"
+        if len(df['Zeitstempel'].unique()) != len(df):
+            return False, f"{name}: Doppelte Zeitstempel gefunden"
+    return True, 'Datenvalidierung erfolgreich'
 
-    soc = E_kWh * soc0_perc / 100.0
-    soc_arr[0] = soc
+# ─────────────────────────────────────────────────────────────
+# Solver – Eigenverbrauchsmaximierung (Single Battery)
+# Variablen: ch_pv, dh_ev, pv_grid, grid_ev, pv_curt, c, d, soc
+# Ziel: min Σ grid_ev + ε·Σ pv_curt
+# ─────────────────────────────────────────────────────────────
 
-    imp_limit_e = grid_imp_kW * dt_h
-    exp_limit_e = grid_exp_kW * dt_h
-    ch_limit_e  = P_kW * dt_h
-    dis_limit_e = P_kW * dt_h
+def solve_ev_only(pv, ev, cfg, grid_kw, interval_h, progress=None, eps_curt=1e-6):
+    T = len(pv)
+    cap = cfg['cap']
+    eff = cfg['eff_pct'] ** 0.5
+    pmax = cfg['bat_kw'] * interval_h  # kWh pro Schritt
+    gmax = grid_kw * interval_h        # kWh pro Richtung & Schritt
 
-    for i, row in enumerate(df.itertuples(index=False)):
-        pv = float(row.pv)
-        ev = float(row.ev)
+    # Vorrangaufteilung fix: PV→EV
+    pv_ev = np.minimum(pv, ev)
+    pv_sur = pv - pv_ev
+    ev_res = ev - pv_ev
 
-        # 1) PV -> EV
-        pv_ev = min(pv, ev)
-        pv -= pv_ev
-        ev -= pv_ev
+    m = pulp.LpProblem('EV_ONLY', pulp.LpMinimize)
 
-        # 2) Batterie -> EV (so viel wie möglich decken)
-        # Max. AC-Energie aus Batterie = soc * eta_d
-        batt_to_ev_max = min(dis_limit_e, soc * eta_d)
-        dis_ev = min(ev, batt_to_ev_max)
-        ev -= dis_ev
-        soc -= dis_ev / eta_d  # SoC-Abnahme (AC -> DC)
+    # Variablen
+    c  = pulp.LpVariable.dicts('c',  range(T), cat='Binary')
+    d  = pulp.LpVariable.dicts('d',  range(T), cat='Binary')
+    ch_pv  = pulp.LpVariable.dicts('ch_pv',  range(T), lowBound=0, upBound=pmax)
+    dh_ev  = pulp.LpVariable.dicts('dh_ev',  range(T), lowBound=0, upBound=pmax)
+    pv_grid= pulp.LpVariable.dicts('pv_grid',range(T), lowBound=0, upBound=gmax)
+    grid_ev= pulp.LpVariable.dicts('grid_ev',range(T), lowBound=0, upBound=gmax)
+    pv_curt= pulp.LpVariable.dicts('pv_curt',range(T), lowBound=0)
+    soc    = pulp.LpVariable.dicts('soc',    range(T), lowBound=0, upBound=cap)
 
-        # 3) Rest-Last per Netzimport (begrenzt)
-        imp_ev = min(ev, imp_limit_e)
-        ev -= imp_ev
-        # ev ist jetzt unversorgter Rest (shed); wir erfassen ihn nicht in KPIs,
-        # zeigen aber einen Warnhinweis am Ende, falls > 0 auftritt.
+    # Ziel: Netzbezug minimieren + winzige Strafe für Curtailment
+    m += pulp.lpSum(grid_ev[t] + eps_curt*pv_curt[t] for t in range(T))
 
-        # 4) PV-Überschuss -> Batterie (Laden)
-        # Max. AC-Energie, die wir laden können, begrenzt durch Platz (DC/η_c)
-        room_ac = max((E_kWh - soc) / eta_c, 0.0)
-        ch_e = min(pv, ch_limit_e, room_ac)
-        pv -= ch_e
-        soc += ch_e * eta_c  # SoC-Zunahme (AC -> DC)
+    for t in range(T):
+        # Power & keine Gleichzeitigkeit
+        m += c[t] + d[t] <= 1
+        m += ch_pv[t] <= pmax * c[t]
+        m += dh_ev[t] <= pmax * d[t]
 
-        # 5) PV-Rest -> Export (begrenzt) und ggf. Spill
-        exp_e = min(pv, exp_limit_e)
-        pv -= exp_e
-        spill = pv  # verbleibender Rest (Curtailment)
+        # Aufteilung Überschüsse/Bedarfe
+        m += ch_pv[t] + pv_grid[t] + pv_curt[t] == float(pv_sur[t])
+        m += dh_ev[t] + grid_ev[t] == float(ev_res[t])
 
-        # Ergebnisse schreiben
-        pv_to_ev[i] = pv_ev
-        dis_to_ev[i] = dis_ev
-        imp_to_ev[i] = imp_ev
-        pv_to_ch[i] = ch_e
-        pv_to_exp[i] = exp_e
-        pv_spill[i]  = spill
-        soc_arr[i+1] = soc
+        # SoC-Dynamik
+        prev = cfg['start_soc'] if t == 0 else soc[t-1]
+        m += soc[t] == prev + eff * ch_pv[t] - dh_ev[t] / eff
 
-    out = df.copy()
-    out["pv_to_ev"] = pv_to_ev
-    out["dis_to_ev"] = dis_to_ev
-    out["imp_to_ev"] = imp_to_ev
-    out["pv_to_ch"] = pv_to_ch
-    out["pv_to_exp"] = pv_to_exp
-    out["pv_spill"]  = pv_spill
-    out["soc_kwh"]   = soc_arr[1:]
+        # Netzanschluss je Richtung
+        m += pv_grid[t] <= gmax
+        m += grid_ev[t] <= gmax
 
-    # KPIs
-    out["self_consumed_pv"] = out["pv_to_ev"] + out["pv_to_ch"]  # PV, die vor Ort genutzt wird
-    out["onsite_supply"] = out["pv_to_ev"] + out["dis_to_ev"]     # EV, die vor Ort gedeckt wurde
+        if progress and t % max(1, T//50) == 0:
+            progress(5 + int(90*t/T))
 
-    return out
+    # Zyklenbudget
+    if cap > 0:
+        m += pulp.lpSum((ch_pv[t] + dh_ev[t]) / (2 * cap) for t in range(T)) <= cfg['max_cycles']
 
+    status = pulp.PULP_CBC_CMD(msg=False, timeLimit=300).solve(m)
 
-def kpi_box(out: pd.DataFrame):
-    if out.empty:
-        return
-    total_pv = out["pv"].sum()
-    total_ev = out["ev"].sum()
-    total_import = out["imp_to_ev"].sum()
-    total_export = out["pv_to_exp"].sum()
-    total_spill  = out["pv_spill"].sum()
-    total_batt_throughput = out["pv_to_ch"].sum() + out["dis_to_ev"].sum()
+    if status != pulp.LpStatusOptimal:
+        return {'status': pulp.LpStatus[status]}
 
-    # Kennzahlen
-    self_consumed = out["self_consumed_pv"].sum()
-    onsite = out["onsite_supply"].sum()
+    to_arr = lambda X: np.array([X[t].value() or 0.0 for t in range(T)])
+    return {
+        'status': 'Optimal',
+        'pv_ev': pv_ev,
+        'pv_sur': pv_sur,
+        'ev_res': ev_res,
+        'ch_pv': to_arr(ch_pv),
+        'dh_ev': to_arr(dh_ev),
+        'pv_grid': to_arr(pv_grid),
+        'grid_ev': to_arr(grid_ev),
+        'pv_curt': to_arr(pv_curt),
+        'soc': to_arr(soc),
+        'cycles': float(((to_arr(ch_pv) + to_arr(dh_ev)) / (2*cap)).sum()) if cap>0 else 0.0,
+        'obj_min_grid': float(pulp.value(m.objective) or 0.0)
+    }
 
-    scr = (self_consumed / total_pv * 100) if total_pv > 0 else 0.0  # Eigenverbrauchsquote PV
-    aut = (onsite / total_ev * 100) if total_ev > 0 else 0.0          # Autarkiegrad
-    cycles = (out["pv_to_ch"].sum() * 1.0 + out["dis_to_ev"].sum() * 1.0) / (2 * total_pv + 1e-9)
-    # Alternativer Zyklen-Schätzer (konservativ): Durchsatz / (2 * E_kWh)
+# ── Session State Initialisierung ───────────────────
+def init_session_state():
+    if 'progress_bar' not in st.session_state:
+        st.session_state.progress_bar = st.sidebar.progress(0)
+        st.session_state.progress_text = st.sidebar.empty()
+    if 'pv_file' not in st.session_state:
+        st.session_state.pv_file = None
+    if 'ev_file' not in st.session_state:
+        st.session_state.ev_file = None
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("PV gesamt [kWh]", f"{total_pv:,.0f}".replace(",", "."))
-    c2.metric("Last gesamt [kWh]", f"{total_ev:,.0f}".replace(",", "."))
-    c3.metric("Eigenverbrauchsquote PV", f"{scr:.1f} %")
-    c4.metric("Autarkiegrad", f"{aut:.1f} %")
-    c5.metric("Import / Export [kWh]", f"{total_import:,.0f} / {total_export:,.0f}".replace(",", "."))
+# ── Streamlit App ───────────────────────────────────
+def main():
+    st.set_page_config(layout='wide')
+    st.title('BESS – Single Battery · Eigenverbrauchsmaximierung')
 
-    if total_spill > 1e-6:
-        st.info(f"PV-Abregelung (Spill): {total_spill:,.0f} kWh".replace(",", "."))
+    init_session_state()
 
+    tab1, tab2, tab3 = st.tabs(['Konfiguration', 'Upload', 'Simulation'])
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Sidebar – Konfiguration
-# ────────────────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("Konfiguration")
+    # ── Tab 1: Konfiguration ────────────────────────
+    with tab1:
+        st.markdown('### Batterie & Netz')
+        start_soc = st.number_input('Start-SoC (kWh)', 0.0, 1e9, 0.0)
+        cap       = st.number_input('Kapazität (kWh)', 0.1, 1e9, 4472.0)
+        bat_kw    = st.number_input('Leistung (kW)', 0.1, 1e9, 559.0)
+        eff_pct   = st.slider('Round-Trip-Effizienz RTE (%)', min_value=1.0, max_value=100.0, value=91.0, step=0.1, format='%.1f') / 100.0
+        max_cycles= st.number_input('Max. Zyklen (im Zeitraum)', 0.0, 1e6, 548.0)
+        grid_kw   = st.number_input('Netzanschluss Limit (kW je Richtung)', 0.1, 1e9, 37000.0)
 
-    colA, colB = st.columns(2)
-    E_kWh = colA.number_input("Batteriekapazität E_max [kWh]", 0.1, 10_000.0, 20.0, step=1.0)
-    P_kW = colB.number_input("Batterieleistung P_max [kW]", 0.1, 10_000.0, 10.0, step=0.5)
+        st.markdown('### Skalierung')
+        pv_scale = st.slider('PV-Skalierung (Anzahl)', min_value=1, max_value=50, value=1, step=1)
+        ev_scale = st.slider('EV-Skalierung (Anzahl)', min_value=1, max_value=50, value=1, step=1)
 
-    colC, colD = st.columns(2)
-    rte_pct = colC.slider("Round-Trip-Effizienz RTE [%]", 60, 100, 92)
-    soc0 = colD.slider("Start-SoC [%]", 0, 100, 50)
+        cfg = {
+            'start_soc': start_soc,
+            'cap': cap,
+            'bat_kw': bat_kw,
+            'eff_pct': eff_pct,
+            'max_cycles': max_cycles
+        }
 
-    colE, colF = st.columns(2)
-    grid_imp = colE.number_input("Netz-Importlimit [kW]", 0.0, 100_000.0, 1_000.0, step=10.0)
-    grid_exp = colF.number_input("Netz-Exportlimit [kW]", 0.0, 100_000.0, 1_000.0, step=10.0)
+        st.button('Konfiguration speichern', on_click=lambda: save_configuration(pv_scale, ev_scale, cfg, grid_kw))
 
-    ts_end = st.checkbox("Zeitstempel sind Periodenende (empfohlen)", value=True)
+    # ── Tab 2: Upload ───────────────────────────────
+    with tab2:
+        st.markdown('### Datei-Upload')
+        st.info('📁 PV- und EV-Zeitreihen laden. Diese stehen in Tab 3 zur Verfügung.')
+        pv_file = st.file_uploader('PV-Lastgang [csv/xls/xlsx] (Zeit, kWh)', type=['csv','xls','xlsx'])
+        if pv_file:
+            st.session_state.pv_file = pv_file
+        ev_file = st.file_uploader('EV-Lastgang [csv/xls/xlsx] (Zeit, kWh)', type=['csv','xls','xlsx'])
+        if ev_file:
+            st.session_state.ev_file = ev_file
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Main – Upload & Simulation
-# ────────────────────────────────────────────────────────────────────────────────
-st.title("BESS – Single Battery · Eigenverbrauchsmaximierung")
+        if st.session_state.pv_file and st.session_state.ev_file:
+            try:
+                pv_df = load_pv_df(st.session_state.pv_file)
+                ev_df = load_ev_df(st.session_state.ev_file)
+                valid, msg = validate_data_ev(pv_df, ev_df)
+                if valid:
+                    st.success('✅ Dateien erfolgreich geladen und validiert.')
+                    ts_all = pv_df['Zeitstempel']
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric('Zeitpunkte', f"{len(ts_all)}")
+                    with c2:
+                        try:
+                            interval = ts_all.diff().dropna().mode()[0].total_seconds()/3600.0
+                            st.metric('Intervall (h)', f"{interval:.2f}")
+                        except Exception:
+                            st.metric('Intervall (h)', 'Unbekannt')
+                    with c3:
+                        st.metric('Zeitraum', f"{ts_all.min():%d.%m.%Y} – {ts_all.max():%d.%m.%Y}")
+                    st.markdown('##### Vorschau (5 Zeilen)')
+                    st.dataframe(pd.DataFrame({
+                        'Zeit': ts_all.head(),
+                        'PV (kWh)': pv_df['PV_kWh'].head(),
+                        'EV (kWh)': ev_df['EV_kWh'].head()
+                    }))
+                else:
+                    st.error(f"❌ Validierungsfehler: {msg}")
+            except Exception as e:
+                st.error(f"❌ Fehler beim Laden der Dateien: {e}")
 
-st.subheader("Upload")
-col1, col2 = st.columns(2)
-with col1:
-    pv_file = st.file_uploader("PV-Zeitreihe (xlsx/csv)", type=["xlsx", "xls", "csv"], key="pv")
-with col2:
-    ev_file = st.file_uploader("EV-/Last-Zeitreihe (xlsx/csv)", type=["xlsx", "xls", "csv"], key="ev")
+    # ── Tab 3: Simulation ───────────────────────────
+    with tab3:
+        st.markdown('### Simulation')
+        c1, c2 = st.columns(2)
+        with c1: st.markdown(f"**PV-Daten:** {'✅' if st.session_state.pv_file else '❌'}")
+        with c2: st.markdown(f"**EV-Daten:** {'✅' if st.session_state.ev_file else '❌'}")
 
-pv_df = read_timeseries(pv_file)
-ev_df = read_timeseries(ev_file)
+        ready = all([st.session_state.pv_file, st.session_state.ev_file])
+        if st.button('▶️ Eigenverbrauch optimieren', disabled=not ready):
+            try:
+                # Daten laden
+                pv_df = load_pv_df(st.session_state.pv_file)
+                ev_df = load_ev_df(st.session_state.ev_file)
 
-if not pv_df.empty and not ev_df.empty:
-    set_progress(10)
-    data = align_series(pv_df, ev_df)
-    if data.empty:
-        st.error("Keine überlappenden Zeitstempel zwischen PV und Last gefunden.")
-    else:
-        st.success(f"Daten geladen: {len(data):,} Schritte".replace(",", "."))
-        dt_h = infer_dt_hours(data["ts"]) 
-        st.caption(f"Erkannter Zeitschritt Δt = {dt_h:.4f} h")
+                valid, msg = validate_data_ev(pv_df, ev_df)
+                if not valid:
+                    st.error(f"❌ Validierungsfehler: {msg}")
+                    st.stop()
 
-        st.subheader("Simulation")
-        if st.button("Eigenverbrauch optimieren", type="primary"):
-            set_progress(40)
-            out = simulate_ev_only(
-                data, E_kWh=E_kWh, P_kW=P_kW, rte=rte_pct/100.0,
-                soc0_perc=soc0, grid_imp_kW=grid_imp, grid_exp_kW=grid_exp,
-                ts_is_period_end=ts_end,
-            )
-            set_progress(70)
+                ts = pv_df['Zeitstempel']
+                pv = pv_df['PV_kWh'].to_numpy() * pv_scale
+                ev = ev_df['EV_kWh'].to_numpy() * ev_scale
 
-            # KPIs
-            kpi_box(out)
+                if len(pv) != len(ev):
+                    st.error('❌ Datenreihen haben unterschiedliche Längen')
+                    st.stop()
 
-            # Charts
-            st.subheader("Zeitreihen")
-            show_cols = [
-                "pv", "ev", "pv_to_ev", "dis_to_ev", "imp_to_ev", "pv_to_ch", "pv_to_exp", "pv_spill"
-            ]
-            st.line_chart(out.set_index("ts")[show_cols])
-            st.area_chart(out.set_index("ts")["soc_kwh"], height=140, use_container_width=True)
+                try:
+                    interval_h = ts.diff().dropna().mode()[0].total_seconds()/3600.0
+                    if not (0 < interval_h <= 24):
+                        raise ValueError
+                except Exception:
+                    interval_h = 1.0
+                    st.warning('⚠️ Intervall unbekannt – setze 1h')
 
-            # Excel-Export
-            st.subheader("Export")
-            with BytesIO() as buffer:
-                with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-                    out.to_excel(writer, index=False, sheet_name="EV_only")
-                st.download_button(
-                    label="Excel herunterladen (inkl. SoC)",
-                    data=buffer.getvalue(),
-                    file_name="ev_only_self_consumption.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                st.info(f'📊 Optimierung für {len(pv)} Schritte @ {interval_h:.2f}h')
 
-            # Warnung bei unversorgter Last (shed)
-            # Hier wird indirekt geprüft: wenn ev nach Schritt 3 > 0 blieb, hätten wir shed.
-            # Wir rekonstruieren es:
-            shed = (out["ev"] - out["pv_to_ev"] - out["dis_to_ev"] - out["imp_to_ev"]).clip(lower=0).sum()
-            if shed > 1e-6:
-                st.warning(
-                    "Es gab unversorgte Last (Netzlimit zu niedrig oder Batterie zu klein).\n"
-                    "Erhöhe ggf. Importlimit oder Kapazitäten."
-                )
+                # Optimierung
+                res = solve_ev_only(pv, ev, cfg, grid_kw, interval_h, set_progress)
+                if res.get('status') != 'Optimal':
+                    st.error(f"Optimierung nicht optimal: {res.get('status')}")
+                    st.stop()
 
-            set_progress(100)
-else:
-    st.info("Bitte PV- und Last-Datei hochladen.")
-    set_progress(0)
+                # Ergebnisse
+                pv_ev      = res['pv_ev']
+                pv_sur     = res['pv_sur']
+                ev_res     = res['ev_res']
+                ch_pv      = res['ch_pv']
+                dh_ev      = res['dh_ev']
+                pv_grid    = res['pv_grid']
+                grid_ev    = res['grid_ev']
+                pv_curt    = res['pv_curt']
+                soc        = res['soc']
+
+                # Kennzahlen
+                ev_total = ev.sum()
+                pv_total = pv.sum()
+                ev_from_pv = pv_ev.sum()
+                ev_from_batt = dh_ev.sum()
+                ev_from_grid = grid_ev.sum()
+                autarkie_ev = ((ev_from_pv + ev_from_batt) / ev_total * 100) if ev_total>0 else 0.0
+
+                pv_to_batt = ch_pv.sum()
+                pv_export  = pv_grid.sum()
+                pv_curt_tot= pv_curt.sum()
+                pv_ev_share= (ev_from_pv / pv_total * 100) if pv_total>0 else 0.0
+                pv_selfuse = ev_from_pv + ch_pv.sum()
+                pv_selfuse_q = (pv_selfuse / pv_total * 100) if pv_total>0 else 0.0
+
+                m1, m2, m3, m4, m5 = st.columns(5)
+                with m1: st.metric('EV-Autarkie', f"{autarkie_ev:.1f}%")
+                with m2: st.metric('PV→EV (MWh)', f"{ev_from_pv/1000:.1f}")
+                with m3: st.metric('Batt→EV (MWh)', f"{ev_from_batt/1000:.1f}")
+                with m4: st.metric('EV aus Netz (MWh)', f"{ev_from_grid/1000:.1f}")
+                with m5: st.metric('PV-Export (MWh)', f"{pv_export/1000:.1f}")
+
+                m6, m7, m8, m9, m10 = st.columns(5)
+                with m6: st.metric('PV→Batt (MWh)', f"{pv_to_batt/1000:.1f}")
+                with m7: st.metric('PV-Curtail (MWh)', f"{pv_curt_tot/1000:.1f}")
+                with m8: st.metric('PV-EV-Anteil', f"{pv_ev_share:.1f}%")
+                with m9: st.metric('PV-Eigenverbrauchsquote', f"{pv_selfuse_q:.1f}%")
+                with m10: st.metric('Zyklen genutzt', f"{res['cycles']:.1f}")
+
+                # Zeitreihen-DF
+                results_df = pd.DataFrame({
+                    'Zeit': ts,
+                    'PV_kWh': pv,
+                    'EV_kWh': ev,
+                    'PV→EV_kWh': pv_ev,
+                    'EV_Rest_kWh': ev_res,
+                    'PV_Überschuss_kWh': pv_sur,
+                    'ch_pv_kWh': ch_pv,
+                    'dh_ev_kWh': dh_ev,
+                    'PV_Export_kWh': pv_grid,
+                    'EV_aus_Netz_kWh': grid_ev,
+                    'PV_Curtail_kWh': pv_curt,
+                    'SoC_kWh': soc
+                })
+
+                st.markdown('#### Zeitreihen (Ausschnitt)')
+                st.dataframe(results_df.head(200))
+
+                # Quartalsaggregation (Import/Export)
+                results_df['Quartal'] = results_df['Zeit'].dt.to_period('Q')
+                q = results_df.groupby('Quartal').agg({
+                    'EV_aus_Netz_kWh': 'sum',
+                    'PV_Export_kWh': 'sum',
+                    'PV_Curtail_kWh': 'sum'
+                }).reset_index()
+                if not q.empty:
+                    q['Quartal_str'] = q['Quartal'].astype(str)
+                    st.markdown('#### Quartalsbilanz (MWh) – Netzbezug / Export / Curtail')
+                    chart_df = q.set_index('Quartal_str')/1000.0
+                    st.bar_chart(chart_df[['EV_aus_Netz_kWh','PV_Export_kWh','PV_Curtail_kWh']], height=300)
+
+                # Export
+                st.markdown('#### Export')
+                buf = BytesIO()
+                results_df.to_excel(buf, index=False, engine='openpyxl')
+                buf.seek(0)
+                st.download_button('📥 Excel-Export', buf,
+                    file_name=f"BESS_Single_Eigenverbrauch_{pd.Timestamp.now():%Y%m%d_%H%M%S}.xlsx",
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+            except Exception as e:
+                st.error(f"❌ Fehler bei der Simulation: {e}")
+                st.exception(e)
+
+# ── Konfiguration speichern ─────────────────────────
+def save_configuration(pv_scale, ev_scale, cfg, grid_kw):
+    config = {
+        'timestamp': pd.Timestamp.now().isoformat(),
+        'pv_scale': pv_scale,
+        'ev_scale': ev_scale,
+        'battery': cfg,
+        'grid_kw': grid_kw
+    }
+    json_str = json.dumps(config, indent=2)
+    st.download_button('💾 Konfiguration als JSON speichern', json_str,
+        file_name=f"BESS_Single_EVonly_Config_{pd.Timestamp.now():%Y%m%d_%H%M}.json", mime='application/json')
+
+if __name__ == '__main__':
+    main()
