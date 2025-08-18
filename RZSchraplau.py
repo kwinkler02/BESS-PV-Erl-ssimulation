@@ -1,4 +1,4 @@
-import streamlit as st
+import streamlit as st 
 import pandas as pd
 import numpy as np
 import pulp
@@ -28,7 +28,7 @@ def parse_flexible_timestamp(ts_series):
         s = str(ts).strip()
         try:
             parsed.append(pd.to_datetime(s, dayfirst=True))
-        except:
+        except Exception:
             try:
                 if '.' in s and len(s.split('.')[-1].split(' ')[0]) <= 2:
                     parts = s.split('.')
@@ -39,21 +39,23 @@ def parse_flexible_timestamp(ts_series):
                             full = 2000 + yy if yy < 50 else 1900 + yy
                             s = s.replace(f".{y[0]} ", f".{full} ")
                 parsed.append(pd.to_datetime(s, infer_datetime_format=True))
-            except:
+            except Exception:
                 parsed.append(pd.NaT)
     return pd.Series(parsed)
 
 # ── Generischer Daten-Loader ────────────────────────
 def load_generic_series(upl, col_name):
     try:
+        upl.seek(0)  # Wichtig: Filepointer immer zurücksetzen
         if upl.name.lower().endswith('.csv'):
             # Versuche verschiedene CSV-Formate
             try:
                 df = pd.read_csv(upl, sep=';', decimal=',', usecols=[0,1], header=0)
-            except:
-                upl.seek(0)  # Reset file pointer
+            except Exception:
+                upl.seek(0)
                 df = pd.read_csv(upl, sep=',', decimal='.', usecols=[0,1], header=0)
         else:
+            upl.seek(0)
             df = pd.read_excel(upl, usecols=[0,1], engine='openpyxl', header=0)
         
         if len(df.columns) < 2:
@@ -63,7 +65,6 @@ def load_generic_series(upl, col_name):
         df['Zeitstempel'] = parse_flexible_timestamp(df['Zeitstempel'])
         df[col_name] = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
         
-        # Prüfe auf komplett leere Daten
         if df.empty or df[col_name].isna().all():
             raise ValueError(f"Keine gültigen Daten in {col_name} gefunden")
             
@@ -95,11 +96,11 @@ def validate_data(p_df, pv_df, ev_df):
         if len(df['Zeitstempel'].unique()) != len(df):
             return False, f"{name}: Doppelte Zeitstempel gefunden"
     
-    # Prüfe auf negative Preise (Warnung, aber nicht blockierend)
+    # Negative Preise (Warnung, aber nicht blockierend)
     if (p_df['Preis_€/MWh'] < 0).any():
-        st.warning("⚠️ Negative Preise in den Daten gefunden (normal bei erneuerbaren Energien)")
+        st.warning("⚠️ Negative Preise in den Daten gefunden (bei viel EE normal)")
     
-    # Prüfe auf unrealistische Werte
+    # Auffällig hohe Preise
     if (p_df['Preis_€/MWh'] > 1000).any():
         st.warning("⚠️ Sehr hohe Preise (>1000 €/MWh) gefunden")
     
@@ -111,33 +112,53 @@ def solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, progress=None):
     batt_max = cfg['bat_kw'] * interval_h
     grid_max = grid_kw * interval_h
     cap, eff, max_cyc = cfg['cap'], cfg['eff_pct']**0.5, cfg['max_cycles']
+
     m = pulp.LpProblem('BESS', pulp.LpMaximize)
-    c = pulp.LpVariable.dicts('c', range(T), cat='Binary')
-    d = pulp.LpVariable.dicts('d', range(T), cat='Binary')
-    ch = pulp.LpVariable.dicts('ch', range(T), lowBound=0, upBound=batt_max)
-    dh = pulp.LpVariable.dicts('dh', range(T), lowBound=0, upBound=batt_max)
+
+    # Variablen
+    c = pulp.LpVariable.dicts('c', range(T), cat='Binary')  # charge aktiv?
+    d = pulp.LpVariable.dicts('d', range(T), cat='Binary')  # discharge aktiv?
+    ch = pulp.LpVariable.dicts('ch', range(T), lowBound=0, upBound=batt_max)  # kWh
+    dh = pulp.LpVariable.dicts('dh', range(T), lowBound=0, upBound=batt_max)  # kWh
     soc = pulp.LpVariable.dicts('soc', range(T), lowBound=0, upBound=cap)
+
+    # Ziel: Preis * (Entladung - Ladung)
     m += pulp.lpSum(prices[t] * (dh[t] - ch[t]) for t in range(T))
+
     for t in range(T):
+        # Nicht gleichzeitig laden & entladen
         m += c[t] + d[t] <= 1
         m += ch[t] <= batt_max * c[t]
         m += dh[t] <= batt_max * d[t]
-        m += pv[t] + ev[t] + ch[t] - dh[t] <= grid_max
+
+        # Netzlimit (symmetrisch), Import positiv
+        net = ev[t] + ch[t] - pv[t] - dh[t]
+        m +=  net <= grid_max
+        m += -net <= grid_max
+
+        # SoC-Dynamik
         prev = cfg['start_soc'] if t == 0 else soc[t-1]
         m += soc[t] == prev + eff * ch[t] - dh[t] / eff
+
         if progress and t % (max(1, T // 50)) == 0:
             progress(5 + int(45 * t / T))
+
+    # Zyklenbudget (Durchschn. von Ladung & Entladung)
     m += pulp.lpSum((ch[t] + dh[t]) / (2 * cap) for t in range(T)) <= max_cyc
+
     if progress: progress(50)
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=300)  # Erhöht auf 5 Minuten
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=300)
     status = solver.solve(m)
     if progress: progress(90)
+
     if status != pulp.LpStatusOptimal:
         st.warning(f"Solver Status: {pulp.LpStatus[status]}")
         return 0.0, np.zeros(T), np.zeros(T)
+
     obj = pulp.value(m.objective) or 0.0
     ch_v = np.array([ch[t].value() or 0 for t in range(T)])
     dh_v = np.array([dh[t].value() or 0 for t in range(T)])
+
     if progress: progress(100)
     return obj, ch_v, dh_v
 
@@ -145,12 +166,15 @@ def solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, progress=None):
 def solve_joint(prices, pv, ev, cfgs, grid_kw, interval_h, progress=None):
     n, T = len(cfgs), len(prices)
     grid_max = grid_kw * interval_h
+
     effs = [c['eff_pct']**0.5 for c in cfgs]
     batt_maxs = [c['bat_kw'] * interval_h for c in cfgs]
     caps = [c['cap'] for c in cfgs]
     starts = [c['start_soc'] for c in cfgs]
     max_cyc = [c['max_cycles'] for c in cfgs]
+
     m = pulp.LpProblem('BESS_Joint', pulp.LpMaximize)
+
     c_vars, d_vars, ch_vars, dh_vars, soc_vars = {}, {}, {}, {}, {}
     for i in range(n):
         c_vars[i] = pulp.LpVariable.dicts(f'c{i}', range(T), cat='Binary')
@@ -158,30 +182,46 @@ def solve_joint(prices, pv, ev, cfgs, grid_kw, interval_h, progress=None):
         ch_vars[i] = pulp.LpVariable.dicts(f'ch{i}', range(T), lowBound=0, upBound=batt_maxs[i])
         dh_vars[i] = pulp.LpVariable.dicts(f'dh{i}', range(T), lowBound=0, upBound=batt_maxs[i])
         soc_vars[i] = pulp.LpVariable.dicts(f'so{i}', range(T), lowBound=0, upBound=caps[i])
+
+    # Ziel
     m += pulp.lpSum(prices[t] * pulp.lpSum(dh_vars[i][t] - ch_vars[i][t] for i in range(n)) for t in range(T))
+
     for t in range(T):
         for i in range(n):
             m += c_vars[i][t] + d_vars[i][t] <= 1
             m += ch_vars[i][t] <= batt_maxs[i] * c_vars[i][t]
             m += dh_vars[i][t] <= batt_maxs[i] * d_vars[i][t]
+
             prev = starts[i] if t == 0 else soc_vars[i][t-1]
             m += soc_vars[i][t] == prev + effs[i] * ch_vars[i][t] - dh_vars[i][t] / effs[i]
-        total = pulp.lpSum(ch_vars[i][t] - dh_vars[i][t] for i in range(n))
-        m += pv[t] + ev[t] + total <= grid_max
+
+        # Netzlimit (symmetrisch) je Zeitschritt: Import positiv
+        total_ch = pulp.lpSum(ch_vars[i][t] for i in range(n))
+        total_dh = pulp.lpSum(dh_vars[i][t] for i in range(n))
+        net = ev[t] + total_ch - pv[t] - total_dh
+        m +=  net <= grid_max
+        m += -net <= grid_max
+
         if progress and t % (max(1, T // 50)) == 0:
             progress(5 + int(45 * t / T))
+
+    # Zyklen je Batterie
     for i in range(n):
         m += pulp.lpSum((ch_vars[i][t] + dh_vars[i][t]) / (2 * caps[i]) for t in range(T)) <= max_cyc[i]
+
     if progress: progress(50)
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=300)  # Erhöht auf 5 Minuten
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=300)
     status = solver.solve(m)
     if progress: progress(90)
+
     if status != pulp.LpStatusOptimal:
         st.warning(f"Joint Solver Status: {pulp.LpStatus[status]}")
         return 0.0, [np.zeros(T) for _ in range(n)], [np.zeros(T) for _ in range(n)]
+
     obj = pulp.value(m.objective) or 0.0
     chs = [np.array([ch_vars[i][t].value() or 0 for t in range(T)]) for i in range(n)]
     dhs = [np.array([dh_vars[i][t].value() or 0 for t in range(T)]) for i in range(n)]
+
     if progress: progress(100)
     return obj, chs, dhs
 
@@ -190,8 +230,6 @@ def init_session_state():
     if 'progress_bar' not in st.session_state:
         st.session_state.progress_bar = st.sidebar.progress(0)
         st.session_state.progress_text = st.sidebar.empty()
-    
-    # File state initialisieren
     if 'price_file' not in st.session_state:
         st.session_state.price_file = None
     if 'pv_file' not in st.session_state:
@@ -216,6 +254,7 @@ def main():
         ev_scale = st.number_input('EV-Skalierung (Anzahl)', 1, 20, 1, step=1)
         grid_scale = st.number_input('Netzanschluss-Skalierung', 1.0, 5.0, 1.0, step=0.1)
         enable2 = st.checkbox('Zweite Batterie aktivieren', True)
+
         st.markdown('##### Batterie-Konfigurationen')
         configs = []
         bat_count = 2 if enable2 else 1
@@ -237,8 +276,10 @@ def main():
                 'eff_pct': eff,
                 'max_cycles': cyc
             })
+
         grid_kw_input = st.number_input('Netzanschluss (kW)', 0.1, 1e6, 37000.0)
         grid_kw = grid_kw_input * grid_scale
+
         # Szenarien-Speicherung
         st.button('Konfiguration speichern', on_click=lambda: save_configuration(pv_scale, ev_scale, configs, grid_kw))
 
@@ -247,7 +288,6 @@ def main():
         st.markdown('### Datei-Upload')
         st.info('📁 Laden Sie hier Ihre Dateien hoch. Diese stehen dann auch in Tab 3 zur Verfügung.')
         
-        # File Uploader mit Session State
         price_file = st.file_uploader('Preisgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
         if price_file:
             st.session_state.price_file = price_file
@@ -271,7 +311,6 @@ def main():
                 if valid:
                     st.success("✅ Dateien erfolgreich geladen und validiert.")
                     
-                    # Datenvorschau
                     col1, col2, col3 = st.columns(3)
                     ts_all = p_df['Zeitstempel']
                     
@@ -290,7 +329,6 @@ def main():
                         end_date = ts_all.max().strftime('%d.%m.%Y')
                         st.metric('Zeitraum', f"{start_date} - {end_date}")
                         
-                    # Kleine Datenvorschau
                     st.markdown('##### Datenvorschau (erste 5 Zeilen)')
                     preview_df = pd.DataFrame({
                         'Zeit': ts_all.head(),
@@ -310,7 +348,6 @@ def main():
     with tab3:
         st.markdown('### Simulation und Ergebnis-Vergleich')
         
-        # Status der hochgeladenen Dateien anzeigen
         col1, col2, col3 = st.columns(3)
         with col1:
             status = "✅" if st.session_state.price_file else "❌"
@@ -326,6 +363,7 @@ def main():
             st.warning('⚠️ Bitte laden Sie zuerst alle Dateien in Tab 2 hoch.')
             
         if st.button('▶️ Simulation starten', disabled=not all([st.session_state.price_file, st.session_state.pv_file, st.session_state.ev_file])):
+            sim_ok = False
             try:
                 p_df = load_price_df(st.session_state.price_file)
                 pv_df = load_pv_df(st.session_state.pv_file)
@@ -337,11 +375,10 @@ def main():
                     st.stop()
                     
                 ts = p_df['Zeitstempel']
-                prices = p_df['Preis_€/MWh'].to_numpy() / 1000.0
+                prices = p_df['Preis_€/MWh'].to_numpy() / 1000.0  # €/kWh
                 pv = pv_df['PV_kWh'].to_numpy() * pv_scale
                 ev = ev_df['EV_kWh'].to_numpy() * ev_scale
                 
-                # Prüfe auf Dateninkonsistenzen
                 if len(prices) != len(pv) or len(prices) != len(ev):
                     st.error("❌ Datenreihen haben unterschiedliche Längen")
                     st.stop()
@@ -402,23 +439,24 @@ def main():
                 analysis_cols = st.columns(4)
                 with analysis_cols[0]:
                     st.metric('💹 Δ absolut', fmt_euro(delta), delta=f"{delta:+.2f}")
-                    
+                
                 with analysis_cols[1]:
                     st.metric('📈 Δ prozentual', f"{pct:+.2f}%", delta=f"{pct:+.2f}")
-                    
-                net_load = pv + ev + sum(chs_joint) - sum(dhs_joint)
-                util = np.mean(net_load/(grid_kw*interval_h))*100 if grid_kw > 0 else 0
+                
+                sum_ch = np.sum(chs_joint, axis=0) if len(chs_joint) else np.zeros_like(ev)
+                sum_dh = np.sum(dhs_joint, axis=0) if len(dhs_joint) else np.zeros_like(ev)
+                net_load = ev - pv + sum_ch - sum_dh  # kWh pro Schritt, Import positiv
+                
+                util = np.mean(np.abs(net_load)/(grid_kw*interval_h))*100 if grid_kw > 0 else 0
+                viol = (np.abs(net_load) > grid_kw*interval_h).sum()
                 
                 with analysis_cols[2]:
-                    color = "normal" if util < 80 else "inverse"
                     st.metric('⚡ Netzauslastung', f"{util:.1f}%")
-                    
                 with analysis_cols[3]:
-                    viol = (net_load > grid_kw*interval_h).sum()
                     st.metric('⚠️ Überlastungen', f"{viol}")
                     
                 if viol > 0:
-                    st.error(f"🚨 {viol} Zeitpunkte mit Netzüberlastung detected!")
+                    st.error(f"🚨 {viol} Zeitpunkte mit Netzüberlastung erkannt!")
                     
                 if delta > 0:
                     st.success(f"✅ Gemeinsame Optimierung bringt {fmt_euro(delta)} Mehrerlös ({pct:.1f}%)")
@@ -427,19 +465,17 @@ def main():
                 else:
                     st.info("ℹ️ Kein Unterschied zwischen Einzel- und Gemeinschaftsoptimierung")
                 
-                # Detaillierte Netzauslastungs-Analyse
+                # ── Netzauslastungs-Analyse ─────────────────────────
                 st.subheader('📈 Netzauslastungs-Analyse')
-                
-                # Zeitreihen-Daten vorbereiten (viertelstündliche Auflösung)
                 analysis_df = pd.DataFrame({
                     'Zeit': ts,
-                    'Netzlast_kW': net_load / interval_h if interval_h > 0 else net_load * 4,  # Bei 0.25h → *4 für kW
+                    'Netzlast_kW': net_load / interval_h if interval_h > 0 else net_load * 4,
                     'Netzlast_kWh': net_load,
-                    'Auslastung_%': (net_load / (grid_kw * interval_h)) * 100 if grid_kw > 0 else 0,
+                    'Auslastung_%': (np.abs(net_load) / (grid_kw * interval_h)) * 100 if grid_kw > 0 else 0,
                     'PV_Erzeugung': pv,
                     'EV_Verbrauch': ev,
-                    'Batt_Laden': sum(chs_joint),
-                    'Batt_Entladen': sum(dhs_joint)
+                    'Batt_Laden': sum_ch,
+                    'Batt_Entladen': sum_dh
                 })
                 
                 # Quartalsweise Aggregation für Säulendiagramm
@@ -452,29 +488,16 @@ def main():
                 
                 if not quarterly_stats.empty:
                     quarterly_stats['Quartal_str'] = quarterly_stats['Quartal'].astype(str)
-                    
-                    # Streamlit native Charts verwenden
                     st.markdown("#### 📊 Netzauslastung - Quartalsübersicht")
-                    
-                    # Oberes Diagramm: Auslastung in %
                     st.markdown("**Durchschnittliche Netzauslastung pro Quartal (%)**")
-                    st.bar_chart(
-                        data=quarterly_stats.set_index('Quartal_str')['Auslastung_%'],
-                        height=300
-                    )
-                    
-                    # Unteres Diagramm: Absolute Werte in MWh
+                    st.bar_chart(data=quarterly_stats.set_index('Quartal_str')['Auslastung_%'], height=300)
                     st.markdown("**Gesamte Netzlast pro Quartal (MWh)**")
                     quarterly_chart_data = quarterly_stats.set_index('Quartal_str')
                     quarterly_chart_data['Netzlast_MWh'] = quarterly_chart_data['Netzlast_kWh'] / 1000
-                    st.bar_chart(
-                        data=quarterly_chart_data['Netzlast_MWh'],
-                        height=300
-                    )
+                    st.bar_chart(data=quarterly_chart_data['Netzlast_MWh'], height=300)
                 
-                # Zahlenmäßige Jahresauswertung
+                # ── Zahlenmäßige Jahresauswertung ───────────────────
                 st.markdown("#### 📋 Zahlenmäßige Jahresauswertung")
-                
                 total_net_kwh = analysis_df['Netzlast_kWh'].sum()
                 avg_net_kw = analysis_df['Netzlast_kW'].mean() if not analysis_df.empty else 0
                 max_net_kw = analysis_df['Netzlast_kW'].max() if not analysis_df.empty else 0
@@ -490,46 +513,40 @@ def main():
                 with net_cols[3]:
                     st.metric("📉 Min Netzlast", f"{min_net_kw:.1f} kW")
                 
-                # Eigenverbrauchsdeckungs-Analyse (viertelstündlich korrekt)
+                # ── Eigenverbrauchsdeckungs-Analyse ────────────────
                 st.subheader('🏠 Eigenverbrauchsdeckungs-Analyse')
-                
-                # Prüfe ob genug Daten vorhanden
                 if len(pv) > 0 and len(ev) > 0:
-                    # Viertelstündliche Eigenverbrauchsberechnung
-                    # Für jeden Zeitpunkt prüfen: PV → Batterie → Netz Hierarchie
                     pv_to_ev_direct = np.zeros(len(pv))
                     batt_to_ev = np.zeros(len(pv))
                     grid_to_ev = np.zeros(len(pv))
                     
-                    total_batt_output = sum(dhs_joint)  # Gesamte Batterieentladung
+                    total_batt_output = sum_dh  # Batterie-Output je t
                     
                     for t in range(len(pv)):
-                        ev_demand_t = ev[t]  # EV-Bedarf zu Zeitpunkt t
-                        pv_available_t = pv[t]  # PV-Erzeugung zu Zeitpunkt t
-                        batt_available_t = total_batt_output[t]  # Batterie-Output zu Zeitpunkt t
+                        ev_demand_t = ev[t]
+                        pv_available_t = pv[t]
+                        batt_available_t = total_batt_output[t]
                         
-                        # 1. PV deckt direkt EV-Bedarf
+                        # 1) PV → EV
                         pv_direct = min(pv_available_t, ev_demand_t)
                         pv_to_ev_direct[t] = pv_direct
                         remaining_ev = ev_demand_t - pv_direct
                         
-                        # 2. Batterie deckt restlichen EV-Bedarf
+                        # 2) Batterie → EV
                         if remaining_ev > 0:
                             batt_contribution = min(batt_available_t, remaining_ev)
                             batt_to_ev[t] = batt_contribution
                             remaining_ev -= batt_contribution
                         
-                        # 3. Netz deckt final verbleibenden Bedarf
+                        # 3) Netz → EV
                         if remaining_ev > 0:
                             grid_to_ev[t] = remaining_ev
                     
-                    # Gesamtsummen
                     total_pv_to_ev = pv_to_ev_direct.sum()
-                    total_batt_to_ev = batt_to_ev.sum()  
+                    total_batt_to_ev = batt_to_ev.sum()
                     total_grid_to_ev = grid_to_ev.sum()
                     total_ev_demand = ev.sum()
                     
-                    # Tortendiagramm-Daten für Streamlit
                     if total_ev_demand > 0:
                         pie_data = pd.DataFrame({
                             'Energiequelle': ['🌞 PV-Direktversorgung', '🔋 Batterie-Versorgung', '🔌 Netzbezug'],
@@ -542,74 +559,52 @@ def main():
                         })
                         
                         st.markdown("#### 🥧 EV-Eigenverbrauchsdeckung")
-                        
-                        # Streamlit native pie chart alternative (bar chart)
-                        st.bar_chart(
-                            data=pie_data.set_index('Energiequelle')['MWh'],
-                            height=400
-                        )
-                        
-                        # Zusätzliche Tabelle für genaue Werte
+                        st.bar_chart(data=pie_data.set_index('Energiequelle')['MWh'], height=400)
                         st.dataframe(
-                            pie_data.style.format({
-                                'MWh': '{:.1f}',
-                                'Anteil_%': '{:.1f}%'
-                            }),
+                            pie_data.style.format({'MWh': '{:.1f}', 'Anteil_%': '{:.1f}%'}),
                             hide_index=True
                         )
                         
-                        # Detaillierte Zahlen zur Eigenverbrauchsdeckung
-                        st.markdown("#### 📊 Detaillierte Eigenverbrauchsstatistik")
-                        
-                        # Autarkie-Grade berechnen (robuste Division)
+                        # Kennzahlen
                         ev_autarkie = ((total_pv_to_ev + total_batt_to_ev) / total_ev_demand * 100)
                         pv_autarkie_ev = (total_pv_to_ev / total_ev_demand * 100)
                         batt_contribution = (total_batt_to_ev / total_ev_demand * 100)
                         grid_dependency = (total_grid_to_ev / total_ev_demand * 100)
                         
-                        # Wirtschaftlichkeits-Metriken
                         total_pv = pv.sum()
                         if total_pv > 0:
-                            # PV für Direktverbrauch + Batterieladung
-                            pv_eigenverbrauch = total_pv_to_ev + sum(chs_joint).sum()  
+                            # Näherung: PV für Direktverbrauch + (alle) Batterieladungen
+                            pv_eigenverbrauch = total_pv_to_ev + np.sum(chs_joint)
                             pv_eigenverbrauchsquote = (pv_eigenverbrauch / total_pv * 100)
                         else:
                             pv_eigenverbrauchsquote = 0
                         
                         autarkie_cols = st.columns(2)
-                        
                         with autarkie_cols[0]:
                             st.markdown("##### 🎯 Autarkie-Grade")
                             st.metric("🔋 Gesamt-Autarkie EV", f"{ev_autarkie:.1f}%")
                             st.metric("🌞 PV-Direktversorgung", f"{pv_autarkie_ev:.1f}%") 
                             st.metric("⚡ Batterie-Beitrag", f"{batt_contribution:.1f}%")
                             st.metric("🔌 Netzbezugs-Anteil", f"{grid_dependency:.1f}%")
-                            
                         with autarkie_cols[1]:
                             st.markdown("##### 💰 Wirtschaftlichkeits-Kennzahlen")
                             st.metric("🏠 PV-Eigenverbrauchsquote", f"{pv_eigenverbrauchsquote:.1f}%")
                             st.metric("📈 Eingesparte Netzbezugs-MWh", f"{(total_pv_to_ev + total_batt_to_ev)/1000:.1f}")
-                            
-                            # Zusätzliche Batterie-Effizienz
-                            total_charge = sum(chs_joint).sum()
-                            total_discharge = sum(dhs_joint).sum()
+                            total_charge = np.sum(chs_joint)
+                            total_discharge = np.sum(dhs_joint)
                             if total_charge > 0:
                                 batt_efficiency = (total_discharge / total_charge * 100)
                                 st.metric("🔄 Batterie-Gesamteffizienz", f"{batt_efficiency:.1f}%")
                             else:
                                 st.metric("🔄 Batterie-Gesamteffizienz", "0.0%")
-                            
-                            # Batterie-Zyklen berechnen (robuste Division by Zero Vermeidung)
-                            cycles_used = 0
+                            cycles_used = 0.0
                             for i, cfg in enumerate(configs):
                                 if cfg['cap'] > 0:
-                                    cycles_used += (chs_joint[i].sum() + dhs_joint[i].sum()) / (2 * cfg['cap'])
+                                    cycles_used += (np.sum(chs_joint[i]) + np.sum(dhs_joint[i])) / (2 * cfg['cap'])
                             st.metric("🔄 Batterie-Zyklen genutzt", f"{cycles_used:.1f}")
                         
-                        # Monatliche Aufteilung für detailliertere Analyse
+                        # Monatliche Aufteilung
                         st.markdown("#### 📅 Monatliche Eigenverbrauchsdeckung")
-                        
-                        # Sichere Monatliche Gruppierung
                         try:
                             analysis_df['Monat'] = analysis_df['Zeit'].dt.to_period('M')
                             monthly_stats = analysis_df.groupby('Monat').agg({
@@ -621,20 +616,15 @@ def main():
                             
                             if not monthly_stats.empty:
                                 monthly_stats['Monat_str'] = monthly_stats['Monat'].astype(str)
-                                
-                                # Monatliche PV-Direktdeckung viertelstündlich korrekt berechnen
+                                # PV-Direktdeckung pro Monat (viertelstündlich korrekt)
                                 monthly_direct_pv = []
                                 for month_period in monthly_stats['Monat']:
                                     mask = analysis_df['Monat'] == month_period
                                     month_pv = analysis_df.loc[mask, 'PV_Erzeugung'].values
                                     month_ev = analysis_df.loc[mask, 'EV_Verbrauch'].values
-                                    # Viertelstündlich minimum nehmen und summieren
                                     direct_pv = np.minimum(month_pv, month_ev).sum()
                                     monthly_direct_pv.append(direct_pv)
-                                
                                 monthly_stats['PV_Direktdeckung'] = monthly_direct_pv
-                                
-                                # Robuste Autarkie-Berechnung
                                 monthly_stats['Autarkie_%'] = 0.0
                                 mask_nonzero = monthly_stats['EV_Verbrauch'] > 0
                                 monthly_stats.loc[mask_nonzero, 'Autarkie_%'] = (
@@ -642,71 +632,58 @@ def main():
                                      monthly_stats.loc[mask_nonzero, 'Batt_Entladen']) / 
                                     monthly_stats.loc[mask_nonzero, 'EV_Verbrauch'] * 100
                                 )
-                                
-                                # Monatliches Säulendiagramm mit Streamlit
                                 st.markdown("**Monatliche Energie-Bilanz (MWh)**")
-                                
-                                monthly_chart_data = monthly_stats.set_index('Monat_str')
-                                monthly_chart_data = monthly_chart_data.rename(columns={
+                                monthly_chart_data = monthly_stats.set_index('Monat_str').rename(columns={
                                     'PV_Erzeugung': '🌞 PV-Erzeugung (MWh)',
                                     'EV_Verbrauch': '🚗 EV-Verbrauch (MWh)', 
                                     'Batt_Entladen': '🔋 Batterie-Output (MWh)'
                                 })
-                                
-                                # Auf MWh umrechnen
                                 for col in ['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']:
                                     monthly_chart_data[col] = monthly_chart_data[col] / 1000
-                                
-                                st.bar_chart(
-                                    data=monthly_chart_data[['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']],
-                                    height=400
-                                )
-                                
-                                # Zusätzlich: Monatliche Autarkie-Tabelle
+                                st.bar_chart(data=monthly_chart_data[['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']], height=400)
                                 st.markdown("**Monatliche Autarkie-Grade**")
                                 autarkie_display = monthly_stats[['Monat_str', 'Autarkie_%']].copy()
                                 autarkie_display.columns = ['Monat', 'Autarkie (%)']
-                                st.dataframe(
-                                    autarkie_display.style.format({'Autarkie (%)': '{:.1f}%'}),
-                                    hide_index=True
-                                )
-                                
+                                st.dataframe(autarkie_display.style.format({'Autarkie (%)': '{:.1f}%'}), hide_index=True)
                         except Exception as e:
                             st.warning(f"⚠️ Monatliche Auswertung konnte nicht erstellt werden: {str(e)}")
-                    
                     else:
                         st.warning("⚠️ Kein EV-Verbrauch gefunden - Eigenverbrauchsanalyse nicht möglich.")
-                        
                 else:
                     st.warning("⚠️ Keine gültigen Daten für Eigenverbrauchsanalyse verfügbar.")
-                    
+
+                # Ergebnisse/Export nur, wenn alles oben durchlief
+                sim_ok = True
+                
             except Exception as e:
                 st.error(f"❌ Fehler bei der Simulation: {str(e)}")
-                st.exception(e)  # Zeigt den vollständigen Stacktrace für Debugging
-                
-            # Ergebnisse-Tabelle & Download
-            st.subheader('Ergebnisse / Export')
-            out = pd.DataFrame({
-                'Zeit': ts,
-                'Preis_€/kWh': prices,
-                'PV_kWh': pv,
-                'EV_kWh': ev
-            })
-            for idx in range(len(configs)):
-                out[f'B{idx+1}_Laden_kWh'] = chs_joint[idx]
-                out[f'B{idx+1}_Entladen_kWh'] = dhs_joint[idx]
-            out['Netzlast_kWh'] = net_load
-            out['Netzlast_%'] = net_load/(grid_kw*interval_h)*100
-            st.dataframe(out)
-            buf = BytesIO()
-            out.to_excel(buf, index=False, engine='openpyxl')
-            buf.seek(0)
-            st.download_button(
-                '📥 Excel-Export', buf,
-                file_name=f"res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
+                st.exception(e)
+            
+            # Ergebnisse-Tabelle & Download (nur bei Erfolg)
+            if sim_ok:
+                st.subheader('Ergebnisse / Export')
+                out = pd.DataFrame({
+                    'Zeit': ts,
+                    'Preis_€/kWh': prices,
+                    'PV_kWh': pv,
+                    'EV_kWh': ev
+                })
+                for idx in range(len(configs)):
+                    out[f'B{idx+1}_Laden_kWh'] = chs_joint[idx]
+                    out[f'B{idx+1}_Entladen_kWh'] = dhs_joint[idx]
+                out['Netzlast_kWh'] = net_load
+                out['Netzlast_%'] = np.where(grid_kw > 0, np.abs(net_load)/(grid_kw*interval_h)*100, 0)
+                st.dataframe(out)
+                buf = BytesIO()
+                out.to_excel(buf, index=False, engine='openpyxl')
+                buf.seek(0)
+                st.download_button(
+                    '📥 Excel-Export', buf,
+                    file_name=f"res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
 
+# ── Konfig speichern ────────────────────────────────
 def save_configuration(pv_scale, ev_scale, configs, grid_kw):
     config = {
         'timestamp': pd.Timestamp.now().isoformat(),
