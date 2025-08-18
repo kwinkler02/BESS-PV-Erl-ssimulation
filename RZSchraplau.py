@@ -403,8 +403,10 @@ def main():
                 if not q.empty:
                     q['Quartal_str'] = q['Quartal'].astype(str)
                     st.markdown('#### Quartalsbilanz (MWh) – Netzbezug / Export / Curtail / Unterdeckung / Unterdeckung-LB')
-                    chart_df = q.set_index('Quartal_str')/1000.0
-                    st.bar_chart(chart_df[['EV_aus_Netz_kWh','PV_Export_kWh','PV_Curtail_kWh','EV_unterdeckt_kWh','EV_unterdeckt_LB_kWh']], height=300)
+                    numeric_cols = ['EV_aus_Netz_kWh','PV_Export_kWh','PV_Curtail_kWh','EV_unterdeckt_kWh','EV_unterdeckt_LB_kWh']
+                    chart_df = q[['Quartal_str'] + numeric_cols].set_index('Quartal_str')
+                    chart_df = chart_df.astype(float) / 1000.0
+                    st.bar_chart(chart_df[numeric_cols], height=300)
 
                 # Export
                 st.markdown('#### Export')
