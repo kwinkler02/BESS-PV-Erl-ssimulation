@@ -32,11 +32,12 @@ def parse_flexible_timestamp(ts_series):
             try:
                 if '.' in s and len(s.split('.')[-1].split(' ')[0]) <= 2:
                     parts = s.split('.')
-                    y = parts[1].split(' ')
-                    if len(y) == 2:
-                        yy = int(y)
-                        full = 2000 + yy if yy < 50 else 1900 + yy
-                        s = s.replace(f".{y} ", f".{full} ")
+                    if len(parts) >= 2:
+                        y = parts[1].split(' ')
+                        if len(y) >= 1:
+                            yy = int(y[0])
+                            full = 2000 + yy if yy < 50 else 1900 + yy
+                            s = s.replace(f".{y[0]} ", f".{full} ")
                 parsed.append(pd.to_datetime(s, infer_datetime_format=True))
             except:
                 parsed.append(pd.NaT)
@@ -44,14 +45,32 @@ def parse_flexible_timestamp(ts_series):
 
 # ── Generischer Daten-Loader ────────────────────────
 def load_generic_series(upl, col_name):
-    if upl.name.lower().endswith('.csv'):
-        df = pd.read_csv(upl, sep=';', decimal=',', usecols=[0,1], header=0)
-    else:
-        df = pd.read_excel(upl, usecols=[0,1], engine='openpyxl', header=0)
-    df.columns = ['Zeitstempel', col_name]
-    df['Zeitstempel'] = parse_flexible_timestamp(df['Zeitstempel'])
-    df[col_name] = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
-    return df
+    try:
+        if upl.name.lower().endswith('.csv'):
+            # Versuche verschiedene CSV-Formate
+            try:
+                df = pd.read_csv(upl, sep=';', decimal=',', usecols=[0,1], header=0)
+            except:
+                upl.seek(0)  # Reset file pointer
+                df = pd.read_csv(upl, sep=',', decimal='.', usecols=[0,1], header=0)
+        else:
+            df = pd.read_excel(upl, usecols=[0,1], engine='openpyxl', header=0)
+        
+        if len(df.columns) < 2:
+            raise ValueError(f"Datei muss mindestens 2 Spalten haben, gefunden: {len(df.columns)}")
+            
+        df.columns = ['Zeitstempel', col_name]
+        df['Zeitstempel'] = parse_flexible_timestamp(df['Zeitstempel'])
+        df[col_name] = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
+        
+        # Prüfe auf komplett leere Daten
+        if df.empty or df[col_name].isna().all():
+            raise ValueError(f"Keine gültigen Daten in {col_name} gefunden")
+            
+        return df
+    except Exception as e:
+        st.error(f"Fehler beim Laden der Datei {upl.name}: {str(e)}")
+        return pd.DataFrame()
 
 def load_price_df(upl): return load_generic_series(upl, 'Preis_€/MWh')
 def load_pv_df(upl):    return load_generic_series(upl, 'PV_kWh')
@@ -59,17 +78,32 @@ def load_ev_df(upl):    return load_generic_series(upl, 'EV_kWh')
 
 # ── Datenvalidierung ────────────────────────────────
 def validate_data(p_df, pv_df, ev_df):
-    if p_df.empty or pv_df.empty or ev_df.empty:
-        return False, 'Leere Datei'
-    # Zeitstempel
+    # Prüfe auf leere DataFrames
+    for df, name in [(p_df,'Preis'), (pv_df,'PV'), (ev_df,'EV')]:
+        if df.empty:
+            return False, f'{name}-Datei ist leer oder konnte nicht geladen werden'
+    
+    # Prüfe gleiche Anzahl von Zeitpunkten
+    lengths = [len(p_df), len(pv_df), len(ev_df)]
+    if not all(l == lengths[0] for l in lengths):
+        return False, f'Unterschiedliche Datenlängen: Preis={lengths[0]}, PV={lengths[1]}, EV={lengths[2]}'
+    
+    # Zeitstempel-Validierung
     for df, name in [(p_df,'Preis'), (pv_df,'PV'), (ev_df,'EV')]:
         if df['Zeitstempel'].isna().any():
-            return False, f"{name} Zeitstempel fehlerhaft"
-    # Negative Werte nur für PV und EV
-    for df, name in [(pv_df,'PV'), (ev_df,'EV')]:
-        if (df.iloc[:,1] < 0).any():
-            return False, f"Neg. Last in {name} Datei"
-    return True, 'OK'
+            return False, f"{name}: Zeitstempel fehlerhaft oder unvollständig"
+        if len(df['Zeitstempel'].unique()) != len(df):
+            return False, f"{name}: Doppelte Zeitstempel gefunden"
+    
+    # Prüfe auf negative Preise (Warnung, aber nicht blockierend)
+    if (p_df['Preis_€/MWh'] < 0).any():
+        st.warning("⚠️ Negative Preise in den Daten gefunden (normal bei erneuerbaren Energien)")
+    
+    # Prüfe auf unrealistische Werte
+    if (p_df['Preis_€/MWh'] > 1000).any():
+        st.warning("⚠️ Sehr hohe Preise (>1000 €/MWh) gefunden")
+    
+    return True, 'Datenvalidierung erfolgreich'
 
 # ── Solver Funktion (Single Batterie) ───────────────
 def solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, progress=None):
@@ -151,15 +185,27 @@ def solve_joint(prices, pv, ev, cfgs, grid_kw, interval_h, progress=None):
     if progress: progress(100)
     return obj, chs, dhs
 
+# ── Session State Initialisierung ───────────────────
+def init_session_state():
+    if 'progress_bar' not in st.session_state:
+        st.session_state.progress_bar = st.sidebar.progress(0)
+        st.session_state.progress_text = st.sidebar.empty()
+    
+    # File state initialisieren
+    if 'price_file' not in st.session_state:
+        st.session_state.price_file = None
+    if 'pv_file' not in st.session_state:
+        st.session_state.pv_file = None
+    if 'ev_file' not in st.session_state:
+        st.session_state.ev_file = None
+
 # ── Streamlit App (UI & Logik modularisiert) ────────
 def main():
     st.set_page_config(layout='wide')
     st.title('BESS: Skalierbar & Szenario-Vergleich')
 
-    # Fortschrittsanzeige initialisieren
-    if 'progress_bar' not in st.session_state:
-        st.session_state.progress_bar = st.sidebar.progress(0)
-        st.session_state.progress_text = st.sidebar.empty()
+    # Session State initialisieren
+    init_session_state()
 
     tab1, tab2, tab3 = st.tabs(['Konfiguration', 'Upload', 'Simulation'])
 
@@ -196,100 +242,468 @@ def main():
         # Szenarien-Speicherung
         st.button('Konfiguration speichern', on_click=lambda: save_configuration(pv_scale, ev_scale, configs, grid_kw))
 
-    # ── Tab 2: Upload ─────────────────────
+    # ── Tab 2: Upload (EINZIGER UPLOAD-BEREICH) ─────────────────
     with tab2:
         st.markdown('### Datei-Upload')
+        st.info('📁 Laden Sie hier Ihre Dateien hoch. Diese stehen dann auch in Tab 3 zur Verfügung.')
+        
+        # File Uploader mit Session State
         price_file = st.file_uploader('Preisgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
-        pv_file    = st.file_uploader('PV-Lastgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
-        ev_file    = st.file_uploader('EV-Lastgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
+        if price_file:
+            st.session_state.price_file = price_file
+            
+        pv_file = st.file_uploader('PV-Lastgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
+        if pv_file:
+            st.session_state.pv_file = pv_file
+            
+        ev_file = st.file_uploader('EV-Lastgang [csv/xls/xlsx]', type=['csv','xls','xlsx'])
+        if ev_file:
+            st.session_state.ev_file = ev_file
 
-        if price_file and pv_file and ev_file:
-            p_df = load_price_df(price_file)
-            pv_df = load_pv_df(pv_file)
-            ev_df = load_ev_df(ev_file)
-            valid, msg = validate_data(p_df, pv_df, ev_df)
-            if valid:
-                st.success("Dateien erfolgreich geladen und validiert.")
-                ts_all = p_df['Zeitstempel']
-                st.metric('Zeitpunkte gesamt', f"{len(ts_all)}")
-                interval = ts_all.diff().dropna().mode()[0].total_seconds()/3600.0
-                st.metric('Intervall (h)', f"{interval:.2f}")
-            else:
-                st.error(msg)
+        # Validierung und Vorschau
+        if st.session_state.price_file and st.session_state.pv_file and st.session_state.ev_file:
+            try:
+                p_df = load_price_df(st.session_state.price_file)
+                pv_df = load_pv_df(st.session_state.pv_file)
+                ev_df = load_ev_df(st.session_state.ev_file)
+                valid, msg = validate_data(p_df, pv_df, ev_df)
+                
+                if valid:
+                    st.success("✅ Dateien erfolgreich geladen und validiert.")
+                    
+                    # Datenvorschau
+                    col1, col2, col3 = st.columns(3)
+                    ts_all = p_df['Zeitstempel']
+                    
+                    with col1:
+                        st.metric('Zeitpunkte gesamt', f"{len(ts_all)}")
+                    
+                    with col2:
+                        try:
+                            interval = ts_all.diff().dropna().mode()[0].total_seconds()/3600.0
+                            st.metric('Intervall (h)', f"{interval:.2f}")
+                        except (IndexError, AttributeError):
+                            st.metric('Intervall (h)', "Unbekannt")
+                            
+                    with col3:
+                        start_date = ts_all.min().strftime('%d.%m.%Y')
+                        end_date = ts_all.max().strftime('%d.%m.%Y')
+                        st.metric('Zeitraum', f"{start_date} - {end_date}")
+                        
+                    # Kleine Datenvorschau
+                    st.markdown('##### Datenvorschau (erste 5 Zeilen)')
+                    preview_df = pd.DataFrame({
+                        'Zeit': ts_all.head(),
+                        'Preis (€/MWh)': p_df['Preis_€/MWh'].head(),
+                        'PV (kWh)': pv_df['PV_kWh'].head(),
+                        'EV (kWh)': ev_df['EV_kWh'].head()
+                    })
+                    st.dataframe(preview_df)
+                    
+                else:
+                    st.error(f"❌ Validierungsfehler: {msg}")
+                    
+            except Exception as e:
+                st.error(f"❌ Fehler beim Laden der Dateien: {str(e)}")
 
-    # ── Tab 3: Simulation & Ergebnisse ─────
+    # ── Tab 3: Simulation & Ergebnisse (OHNE UPLOAD) ─────
     with tab3:
         st.markdown('### Simulation und Ergebnis-Vergleich')
-        price_file = st.sidebar.file_uploader('Preise', type=['csv','xls','xlsx'], key='sidebarpf')
-        pv_file    = st.sidebar.file_uploader('PV-Last', type=['csv','xls','xlsx'], key='sidebarpv')
-        ev_file    = st.sidebar.file_uploader('EV-Last', type=['csv','xls','xlsx'], key='sidebarev')
-        if st.button('▶️ Simulation starten'):
-            if not(price_file and pv_file and ev_file):
-                st.error('Bitte alle Dateien hochladen.')
-            else:
-                p_df = load_price_df(price_file)
-                pv_df = load_pv_df(pv_file)
-                ev_df = load_ev_df(ev_file)
+        
+        # Status der hochgeladenen Dateien anzeigen
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            status = "✅" if st.session_state.price_file else "❌"
+            st.markdown(f"**Preisdaten:** {status}")
+        with col2:
+            status = "✅" if st.session_state.pv_file else "❌"
+            st.markdown(f"**PV-Daten:** {status}")
+        with col3:
+            status = "✅" if st.session_state.ev_file else "❌"
+            st.markdown(f"**EV-Daten:** {status}")
+        
+        if not all([st.session_state.price_file, st.session_state.pv_file, st.session_state.ev_file]):
+            st.warning('⚠️ Bitte laden Sie zuerst alle Dateien in Tab 2 hoch.')
+            
+        if st.button('▶️ Simulation starten', disabled=not all([st.session_state.price_file, st.session_state.pv_file, st.session_state.ev_file])):
+            try:
+                p_df = load_price_df(st.session_state.price_file)
+                pv_df = load_pv_df(st.session_state.pv_file)
+                ev_df = load_ev_df(st.session_state.ev_file)
+                
                 valid, msg = validate_data(p_df, pv_df, ev_df)
                 if not valid:
-                    st.error(msg)
+                    st.error(f"❌ Validierungsfehler: {msg}")
                     st.stop()
+                    
                 ts = p_df['Zeitstempel']
                 prices = p_df['Preis_€/MWh'].to_numpy() / 1000.0
                 pv = pv_df['PV_kWh'].to_numpy() * pv_scale
                 ev = ev_df['EV_kWh'].to_numpy() * ev_scale
-                interval_h = ts.diff().dropna().mode()[0].total_seconds() / 3600.0
-                st.info(f'Intervall: {interval_h:.2f} h')
-                # Optimierung
-                free_results = [solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, set_progress) for cfg in configs]
-                obj_joint, chs_joint, dhs_joint = solve_joint(prices, pv, ev, configs, grid_kw, interval_h, set_progress)
+                
+                # Prüfe auf Dateninkonsistenzen
+                if len(prices) != len(pv) or len(prices) != len(ev):
+                    st.error("❌ Datenreihen haben unterschiedliche Längen")
+                    st.stop()
+                
+                try:
+                    interval_h = ts.diff().dropna().mode()[0].total_seconds() / 3600.0
+                    if interval_h <= 0 or interval_h > 24:
+                        raise ValueError("Unrealistisches Intervall")
+                except (IndexError, AttributeError, ValueError):
+                    interval_h = 1.0
+                    st.warning("⚠️ Intervall konnte nicht bestimmt werden, verwende 1h als Standard")
+                    
+                st.info(f'📊 Optimierung für {len(prices)} Zeitpunkte mit {interval_h:.2f}h Intervall')
+                
+                # Validierung der Konfigurationen
+                for idx, cfg in enumerate(configs, 1):
+                    if cfg['cap'] <= 0 or cfg['bat_kw'] <= 0:
+                        st.error(f"❌ Batterie {idx}: Kapazität und Leistung müssen > 0 sein")
+                        st.stop()
+                    if cfg['eff_pct'] <= 0 or cfg['eff_pct'] > 1:
+                        st.error(f"❌ Batterie {idx}: Wirkungsgrad muss zwischen 0 und 100% liegen")
+                        st.stop()
+                
+                # Optimierung mit Progress
+                with st.spinner('🔄 Führe Optimierungsberechnungen durch...'):
+                    free_results = [solve_battery(prices, pv, ev, cfg, grid_kw, interval_h, set_progress) for cfg in configs]
+                    obj_joint, chs_joint, dhs_joint = solve_joint(prices, pv, ev, configs, grid_kw, interval_h, set_progress)
+            
                 # Einzeloptimierung anzeigen
-                st.subheader('Einzeloptimierung')
+                st.subheader('🔋 Einzeloptimierung (unabhängige Batterien)')
                 tot_free = sum(obj for obj, *_ in free_results)
-                for idx, (cfg, (obj, ch_v, dh_v)) in enumerate(zip(configs, free_results), start=1):
-                    st.metric(f"B{idx} ({cfg['mode']})", fmt_euro(obj))
-                st.metric('Gesamt Free', fmt_euro(tot_free))
-                # Joint
-                st.subheader('Gemeinsam')
-                st.metric('Gesamterlös', fmt_euro(obj_joint))
+                
+                col_metrics = st.columns(len(configs) + 1)
+                for idx, (cfg, (obj, ch_v, dh_v)) in enumerate(zip(configs, free_results)):
+                    with col_metrics[idx]:
+                        st.metric(f"B{idx+1} ({cfg['mode']})", fmt_euro(obj))
+                        
+                with col_metrics[-1]:
+                    st.metric('🔄 Gesamt Einzeln', fmt_euro(tot_free))
+                
+                # Joint Optimierung
+                st.subheader('🔗 Gemeinsame Optimierung')
+                joint_cols = st.columns(len(configs) + 1)
+                
+                with joint_cols[-1]:
+                    st.metric('💰 Gesamterlös', fmt_euro(obj_joint))
+                    
                 for idx in range(len(configs)):
                     share = float(np.dot(prices, dhs_joint[idx] - chs_joint[idx]))
-                    st.metric(f"B{idx+1} Anteil", fmt_euro(share))
-                # Vergleich
+                    with joint_cols[idx]:
+                        st.metric(f"B{idx+1} Anteil", fmt_euro(share))
+                        
+                # Vergleich und Analyse
                 delta = obj_joint - tot_free
-                pct = (delta/abs(tot_free)*100) if tot_free!=0 else 0
-                st.subheader('Vergleich')
-                d1,d2,d3 = st.columns(3)
-                d1.metric('Δ absolut', fmt_euro(delta))
-                d2.metric('Δ %', f"{pct:.2f}%")
+                pct = (delta/abs(tot_free)*100) if tot_free != 0 else 0
+                st.subheader('📊 Analyse & Vergleich')
+                
+                analysis_cols = st.columns(4)
+                with analysis_cols[0]:
+                    st.metric('💹 Δ absolut', fmt_euro(delta), delta=f"{delta:+.2f}")
+                    
+                with analysis_cols[1]:
+                    st.metric('📈 Δ prozentual', f"{pct:+.2f}%", delta=f"{pct:+.2f}")
+                    
                 net_load = pv + ev + sum(chs_joint) - sum(dhs_joint)
-                util = np.mean(net_load/(grid_kw*interval_h))*100
-                d3.metric('Netzauslastung', f"{util:.1f}%")
-                viol = (net_load > grid_kw*interval_h).sum()
+                util = np.mean(net_load/(grid_kw*interval_h))*100 if grid_kw > 0 else 0
+                
+                with analysis_cols[2]:
+                    color = "normal" if util < 80 else "inverse"
+                    st.metric('⚡ Netzauslastung', f"{util:.1f}%")
+                    
+                with analysis_cols[3]:
+                    viol = (net_load > grid_kw*interval_h).sum()
+                    st.metric('⚠️ Überlastungen', f"{viol}")
+                    
                 if viol > 0:
-                    st.warning(f"⚠️ {viol} Überlastungen im Netz")
-                # Ergebnisse-Tabelle & Download
-                st.subheader('Ergebnisse / Export')
-                out = pd.DataFrame({
+                    st.error(f"🚨 {viol} Zeitpunkte mit Netzüberlastung detected!")
+                    
+                if delta > 0:
+                    st.success(f"✅ Gemeinsame Optimierung bringt {fmt_euro(delta)} Mehrerlös ({pct:.1f}%)")
+                elif delta < 0:
+                    st.warning(f"⚠️ Einzeloptimierung wäre {fmt_euro(-delta)} besser ({-pct:.1f}%)")
+                else:
+                    st.info("ℹ️ Kein Unterschied zwischen Einzel- und Gemeinschaftsoptimierung")
+                
+                # Detaillierte Netzauslastungs-Analyse
+                st.subheader('📈 Netzauslastungs-Analyse')
+                
+                # Zeitreihen-Daten vorbereiten (viertelstündliche Auflösung)
+                analysis_df = pd.DataFrame({
                     'Zeit': ts,
-                    'Preis_€/kWh': prices,
-                    'PV_kWh': pv,
-                    'EV_kWh': ev
+                    'Netzlast_kW': net_load / interval_h if interval_h > 0 else net_load * 4,  # Bei 0.25h → *4 für kW
+                    'Netzlast_kWh': net_load,
+                    'Auslastung_%': (net_load / (grid_kw * interval_h)) * 100 if grid_kw > 0 else 0,
+                    'PV_Erzeugung': pv,
+                    'EV_Verbrauch': ev,
+                    'Batt_Laden': sum(chs_joint),
+                    'Batt_Entladen': sum(dhs_joint)
                 })
-                for idx in range(len(configs)):
-                    out[f'B{idx+1}_Laden_kWh'] = chs_joint[idx]
-                    out[f'B{idx+1}_Entladen_kWh'] = dhs_joint[idx]
-                out['Netzlast_kWh'] = net_load
-                out['Netzlast_%'] = net_load/(grid_kw*interval_h)*100
-                st.dataframe(out)
-                buf = BytesIO()
-                out.to_excel(buf, index=False, engine='openpyxl')
-                buf.seek(0)
-                st.download_button(
-                    '📥 Excel-Export', buf,
-                    file_name=f"res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                )
+                
+                # Quartalsweise Aggregation für Säulendiagramm
+                analysis_df['Quartal'] = analysis_df['Zeit'].dt.to_period('Q')
+                quarterly_stats = analysis_df.groupby('Quartal').agg({
+                    'Netzlast_kW': 'mean',
+                    'Auslastung_%': 'mean',
+                    'Netzlast_kWh': 'sum'
+                }).reset_index()
+                
+                if not quarterly_stats.empty:
+                    quarterly_stats['Quartal_str'] = quarterly_stats['Quartal'].astype(str)
+                    
+                    # Streamlit native Charts verwenden
+                    st.markdown("#### 📊 Netzauslastung - Quartalsübersicht")
+                    
+                    # Oberes Diagramm: Auslastung in %
+                    st.markdown("**Durchschnittliche Netzauslastung pro Quartal (%)**")
+                    st.bar_chart(
+                        data=quarterly_stats.set_index('Quartal_str')['Auslastung_%'],
+                        height=300
+                    )
+                    
+                    # Unteres Diagramm: Absolute Werte in MWh
+                    st.markdown("**Gesamte Netzlast pro Quartal (MWh)**")
+                    quarterly_chart_data = quarterly_stats.set_index('Quartal_str')
+                    quarterly_chart_data['Netzlast_MWh'] = quarterly_chart_data['Netzlast_kWh'] / 1000
+                    st.bar_chart(
+                        data=quarterly_chart_data['Netzlast_MWh'],
+                        height=300
+                    )
+                
+                # Zahlenmäßige Jahresauswertung
+                st.markdown("#### 📋 Zahlenmäßige Jahresauswertung")
+                
+                total_net_kwh = analysis_df['Netzlast_kWh'].sum()
+                avg_net_kw = analysis_df['Netzlast_kW'].mean() if not analysis_df.empty else 0
+                max_net_kw = analysis_df['Netzlast_kW'].max() if not analysis_df.empty else 0
+                min_net_kw = analysis_df['Netzlast_kW'].min() if not analysis_df.empty else 0
+                
+                net_cols = st.columns(4)
+                with net_cols[0]:
+                    st.metric("🔌 Gesamt-Netzlast", f"{total_net_kwh/1000:.1f} MWh")
+                with net_cols[1]:
+                    st.metric("⚡ Ø Netzlast", f"{avg_net_kw:.1f} kW")
+                with net_cols[2]:
+                    st.metric("📈 Max Netzlast", f"{max_net_kw:.1f} kW")
+                with net_cols[3]:
+                    st.metric("📉 Min Netzlast", f"{min_net_kw:.1f} kW")
+                
+                # Eigenverbrauchsdeckungs-Analyse (viertelstündlich korrekt)
+                st.subheader('🏠 Eigenverbrauchsdeckungs-Analyse')
+                
+                # Viertelstündliche Eigenverbrauchsberechnung
+                # Für jeden Zeitpunkt prüfen: PV → Batterie → Netz Hierarchie
+                pv_to_ev_direct = np.zeros(len(pv))
+                batt_to_ev = np.zeros(len(pv))
+                grid_to_ev = np.zeros(len(pv))
+                
+                total_batt_output = sum(dhs_joint)  # Gesamte Batterieentladung
+                
+                for t in range(len(pv)):
+                    ev_demand_t = ev[t]  # EV-Bedarf zu Zeitpunkt t
+                    pv_available_t = pv[t]  # PV-Erzeugung zu Zeitpunkt t
+                    batt_available_t = total_batt_output[t]  # Batterie-Output zu Zeitpunkt t
+                    
+                    # 1. PV deckt direkt EV-Bedarf
+                    pv_direct = min(pv_available_t, ev_demand_t)
+                    pv_to_ev_direct[t] = pv_direct
+                    remaining_ev = ev_demand_t - pv_direct
+                    
+                    # 2. Batterie deckt restlichen EV-Bedarf
+                    if remaining_ev > 0:
+                        batt_contribution = min(batt_available_t, remaining_ev)
+                        batt_to_ev[t] = batt_contribution
+                        remaining_ev -= batt_contribution
+                    
+                    # 3. Netz deckt final verbleibenden Bedarf
+                    if remaining_ev > 0:
+                        grid_to_ev[t] = remaining_ev
+                
+                # Gesamtsummen
+                total_pv_to_ev = pv_to_ev_direct.sum()
+                total_batt_to_ev = batt_to_ev.sum()  
+                total_grid_to_ev = grid_to_ev.sum()
+                total_ev_demand = ev.sum()
+                
+                # Tortendiagramm-Daten für Streamlit
+                if total_ev_demand > 0:
+                    pie_data = pd.DataFrame({
+                        'Energiequelle': ['🌞 PV-Direktversorgung', '🔋 Batterie-Versorgung', '🔌 Netzbezug'],
+                        'MWh': [total_pv_to_ev/1000, total_batt_to_ev/1000, total_grid_to_ev/1000],
+                        'Anteil_%': [
+                            (total_pv_to_ev/total_ev_demand)*100,
+                            (total_batt_to_ev/total_ev_demand)*100, 
+                            (total_grid_to_ev/total_ev_demand)*100
+                        ]
+                    })
+                    
+                    st.markdown("#### 🥧 EV-Eigenverbrauchsdeckung")
+                    
+                    # Streamlit native pie chart alternative (bar chart)
+                    st.bar_chart(
+                        data=pie_data.set_index('Energiequelle')['MWh'],
+                        height=400
+                    )
+                    
+                    # Zusätzliche Tabelle für genaue Werte
+                    st.dataframe(
+                        pie_data.style.format({
+                            'MWh': '{:.1f}',
+                            'Anteil_%': '{:.1f}%'
+                        }),
+                        hide_index=True
+                    )
+                
+                # Detaillierte Zahlen zur Eigenverbrauchsdeckung
+                st.markdown("#### 📊 Detaillierte Eigenverbrauchsstatistik")
+                
+                # Autarkie-Grade berechnen (robuste Division)
+                if total_ev_demand > 0:
+                    ev_autarkie = ((total_pv_to_ev + total_batt_to_ev) / total_ev_demand * 100)
+                    pv_autarkie_ev = (total_pv_to_ev / total_ev_demand * 100)
+                    batt_contribution = (total_batt_to_ev / total_ev_demand * 100)
+                    grid_dependency = (total_grid_to_ev / total_ev_demand * 100)
+                else:
+                    ev_autarkie = pv_autarkie_ev = batt_contribution = grid_dependency = 0
+                
+                # Wirtschaftlichkeits-Metriken
+                total_pv = pv.sum()
+                if total_pv > 0:
+                    # PV für Direktverbrauch + Batterieladung
+                    pv_eigenverbrauch = total_pv_to_ev + sum(chs_joint).sum()  
+                    pv_eigenverbrauchsquote = (pv_eigenverbrauch / total_pv * 100)
+                else:
+                    pv_eigenverbrauchsquote = 0
+                
+                autarkie_cols = st.columns(2)
+                
+                with autarkie_cols[0]:
+                    st.markdown("##### 🎯 Autarkie-Grade")
+                    st.metric("🔋 Gesamt-Autarkie EV", f"{ev_autarkie:.1f}%")
+                    st.metric("🌞 PV-Direktversorgung", f"{pv_autarkie_ev:.1f}%") 
+                    st.metric("⚡ Batterie-Beitrag", f"{batt_contribution:.1f}%")
+                    st.metric("🔌 Netzbezugs-Anteil", f"{grid_dependency:.1f}%")
+                    
+                with autarkie_cols[1]:
+                    st.markdown("##### 💰 Wirtschaftlichkeits-Kennzahlen")
+                    st.metric("🏠 PV-Eigenverbrauchsquote", f"{pv_eigenverbrauchsquote:.1f}%")
+                    st.metric("📈 Eingesparte Netzbezugs-MWh", f"{(total_pv_to_ev + total_batt_to_ev)/1000:.1f}")
+                    
+                    # Zusätzliche Batterie-Effizienz
+                    total_charge = sum(chs_joint).sum()
+                    total_discharge = sum(dhs_joint).sum()
+                    if total_charge > 0:
+                        batt_efficiency = (total_discharge / total_charge * 100)
+                        st.metric("🔄 Batterie-Gesamteffizienz", f"{batt_efficiency:.1f}%")
+                    else:
+                        st.metric("🔄 Batterie-Gesamteffizienz", "0.0%")
+                    
+                    # Batterie-Zyklen berechnen (robuste Division by Zero Vermeidung)
+                    cycles_used = 0
+                    for i, cfg in enumerate(configs):
+                        if cfg['cap'] > 0:
+                            cycles_used += (chs_joint[i].sum() + dhs_joint[i].sum()) / (2 * cfg['cap'])
+                    st.metric("🔄 Batterie-Zyklen genutzt", f"{cycles_used:.1f}")
+                
+                # Monatliche Aufteilung für detailliertere Analyse
+                st.markdown("#### 📅 Monatliche Eigenverbrauchsdeckung")
+                
+                # Sichere Monatliche Gruppierung
+                try:
+                    analysis_df['Monat'] = analysis_df['Zeit'].dt.to_period('M')
+                    monthly_stats = analysis_df.groupby('Monat').agg({
+                        'PV_Erzeugung': 'sum',
+                        'EV_Verbrauch': 'sum', 
+                        'Batt_Laden': 'sum',
+                        'Batt_Entladen': 'sum'
+                    }).reset_index()
+                    
+                    if not monthly_stats.empty:
+                        monthly_stats['Monat_str'] = monthly_stats['Monat'].astype(str)
+                        
+                        # Monatliche PV-Direktdeckung viertelstündlich korrekt berechnen
+                        monthly_direct_pv = []
+                        for month_period in monthly_stats['Monat']:
+                            mask = analysis_df['Monat'] == month_period
+                            month_pv = analysis_df.loc[mask, 'PV_Erzeugung'].values
+                            month_ev = analysis_df.loc[mask, 'EV_Verbrauch'].values
+                            # Viertelstündlich minimum nehmen und summieren
+                            direct_pv = np.minimum(month_pv, month_ev).sum()
+                            monthly_direct_pv.append(direct_pv)
+                        
+                        monthly_stats['PV_Direktdeckung'] = monthly_direct_pv
+                        
+                        # Robuste Autarkie-Berechnung
+                        monthly_stats['Autarkie_%'] = 0.0
+                        mask_nonzero = monthly_stats['EV_Verbrauch'] > 0
+                        monthly_stats.loc[mask_nonzero, 'Autarkie_%'] = (
+                            (monthly_stats.loc[mask_nonzero, 'PV_Direktdeckung'] + 
+                             monthly_stats.loc[mask_nonzero, 'Batt_Entladen']) / 
+                            monthly_stats.loc[mask_nonzero, 'EV_Verbrauch'] * 100
+                        )
+                        
+                        # Monatliches Säulendiagramm mit Streamlit
+                        st.markdown("**Monatliche Energie-Bilanz (MWh)**")
+                        
+                        monthly_chart_data = monthly_stats.set_index('Monat_str')
+                        monthly_chart_data = monthly_chart_data.rename(columns={
+                            'PV_Erzeugung': '🌞 PV-Erzeugung (MWh)',
+                            'EV_Verbrauch': '🚗 EV-Verbrauch (MWh)', 
+                            'Batt_Entladen': '🔋 Batterie-Output (MWh)'
+                        })
+                        
+                        # Auf MWh umrechnen
+                        for col in ['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']:
+                            monthly_chart_data[col] = monthly_chart_data[col] / 1000
+                        
+                        st.bar_chart(
+                            data=monthly_chart_data[['🌞 PV-Erzeugung (MWh)', '🚗 EV-Verbrauch (MWh)', '🔋 Batterie-Output (MWh)']],
+                            height=400
+                        )
+                        
+                        # Zusätzlich: Monatliche Autarkie-Tabelle
+                        st.markdown("**Monatliche Autarkie-Grade**")
+                        autarkie_display = monthly_stats[['Monat_str', 'Autarkie_%']].copy()
+                        autarkie_display.columns = ['Monat', 'Autarkie (%)']
+                        st.dataframe(
+                            autarkie_display.style.format({'Autarkie (%)': '{:.1f}%'}),
+                            hide_index=True
+                        )
+                        
+                except Exception as e:
+                    st.warning(f"⚠️ Monatliche Auswertung konnte nicht erstellt werden: {str(e)}")
+                    
+            else:
+                st.warning("⚠️ Keine gültigen Daten für Eigenverbrauchsanalyse verfügbar.")
+                    
+            except Exception as e:
+                st.error(f"❌ Fehler bei der Simulation: {str(e)}")
+                st.exception(e)  # Zeigt den vollständigen Stacktrace für Debugging
+                
+            # Ergebnisse-Tabelle & Download
+            st.subheader('Ergebnisse / Export')
+            out = pd.DataFrame({
+                'Zeit': ts,
+                'Preis_€/kWh': prices,
+                'PV_kWh': pv,
+                'EV_kWh': ev
+            })
+            for idx in range(len(configs)):
+                out[f'B{idx+1}_Laden_kWh'] = chs_joint[idx]
+                out[f'B{idx+1}_Entladen_kWh'] = dhs_joint[idx]
+            out['Netzlast_kWh'] = net_load
+            out['Netzlast_%'] = net_load/(grid_kw*interval_h)*100
+            st.dataframe(out)
+            buf = BytesIO()
+            out.to_excel(buf, index=False, engine='openpyxl')
+            buf.seek(0)
+            st.download_button(
+                '📥 Excel-Export', buf,
+                file_name=f"res_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
 
 def save_configuration(pv_scale, ev_scale, configs, grid_kw):
     config = {
@@ -309,4 +723,3 @@ def save_configuration(pv_scale, ev_scale, configs, grid_kw):
 
 if __name__ == '__main__':
     main()
-
